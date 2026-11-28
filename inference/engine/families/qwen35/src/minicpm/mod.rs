@@ -87,6 +87,7 @@ pub fn describe_projector(
         positions: Some(positions),
         norm: None,
         registers: None,
+        register_positions: None,
     };
     let mut blocks = Vec::with_capacity(depth as usize);
     for layer in 0..depth {
@@ -116,6 +117,8 @@ pub fn describe_projector(
                 down: r.linear(&format!("{p}.ffn_down"), hidden, intermediate)?,
             },
             feedforward_post_norm: None,
+            ls1: None,
+            ls2: None,
         });
     }
     let joined = checked_product(&[4, hidden]).map_err(|e| invalid(e.to_string()))?;

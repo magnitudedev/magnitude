@@ -253,7 +253,10 @@ fn deepseek41_dspark_inspects_and_validates_against_mhc_target() {
     assert_eq!(draft.layout, BlockLayout::AnchorFirst);
     assert_eq!(draft.block_size, 6);
     assert_eq!(draft.max_proposals(), 6);
-    assert_eq!(draft.mask_token, TokenId(42));
+    assert_eq!(
+        draft.mask,
+        magnitude_family_contracts::DraftMask::Token(TokenId(42))
+    );
     assert_eq!(
         draft.taps,
         vec![
@@ -278,7 +281,8 @@ fn deepseek41_dspark_inspects_and_validates_against_mhc_target() {
     let DraftMethod::DSpark { markov, confidence } = &draft.method else {
         panic!("expected DSpark method");
     };
-    assert_eq!(markov.rank, 32);
+    assert_eq!(markov.rank(), 32);
+    let confidence = confidence.as_ref().expect("expected confidence head");
     assert_eq!(confidence.weight.shape, [1, 128 + 32]);
     assert!(confidence.bias.is_none());
 
@@ -294,7 +298,10 @@ fn deepseek41_dspark_inspects_and_validates_against_mhc_target() {
         };
         assert!(matches!(attention.query, QueryProjection::LowRank { .. }));
         assert!(matches!(attention.output, OutputProjection::GroupedLowRank { groups: 2, rank: 16, .. }));
-        assert!(attention.sinks.is_some());
+        assert!(matches!(
+            attention.sinks,
+            magnitude_family_contracts::AttentionSinks::Static(_)
+        ));
         assert!(matches!(
             attention.rotary,
             Rotary::Table { output: OutputRotary::Inverse, .. }

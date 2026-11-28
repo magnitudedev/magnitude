@@ -21,7 +21,8 @@ use magnitude_artifacts::{
 };
 use magnitude_family_common::{rotary, HeaderError, Metadata, Tensors};
 use magnitude_family_contracts::{
-    checked_product, ActivationDType, ActivationFunction, Attention, AttentionGate, Block, Decoder,
+    checked_product, ActivationDType, ActivationFunction, Attention, AttentionGate, AttentionSinks,
+    Block, Decoder,
     DefinitionError, DenseFfn, EmbeddingScale, EntryForm, ExitForm, ExitNorm, FamilyId,
     FeedForwardUp, HeadNorm, HistoryRows, HistorySource, InputNorm, InputSemantics,
     MediaRowAttention, ProjectedRows, RowProducer, RowRounding, TokenDomain, ModelDefinition, Operator, OutputForm, OutputProjection,
@@ -314,6 +315,8 @@ pub fn inspect_components(
                         value: ValueSource::Projected(
                             weight("attn_v.weight", &[key_rows, hidden])?,
                         ),
+                        key_conv: None,
+                        value_conv: None,
                         key_norm: HeadNorm::None,
                         value_norm: ValueNorm::None,
                         domain: TokenDomain::Token,
@@ -321,9 +324,11 @@ pub fn inspect_components(
                     }),
                 ))],
                 rotary: rotary.clone(),
+                relative_bias: None,
+                log_scale: None,
                 scale: 1.0 / (width as f64).sqrt(),
                 media_rows: MediaRowAttention::Causal,
-                sinks: None,
+                sinks: AttentionSinks::None,
                 output: OutputProjection::Full(weight(
                     "attn_output.weight",
                     &[hidden, query_rows],
@@ -344,14 +349,17 @@ pub fn inspect_components(
                     Sublayer {
                         input: InputNorm::Rms(rms(attention_norm)),
                         op: Operator::Attention(Box::new(attention)),
+                        post_conv: None,
                         output: OutputForm::Residual,
                     },
                     Sublayer {
                         input: InputNorm::Rms(rms(weight("ffn_norm.weight", &[hidden])?)),
                         op: Operator::DenseFfn(Box::new(feed_forward)),
+                        post_conv: None,
                         output: OutputForm::Residual,
                     },
                 ],
+                transition: None,
             })
         })
         .collect::<Result<Vec<_>, Error>>()?;
@@ -381,6 +389,7 @@ pub fn inspect_components(
                 norm: ExitNorm::Rms(rms(output_norm)),
                 output,
                 softcap: None,
+                unpadded_vocabulary: None,
             },
         },
         head: None,

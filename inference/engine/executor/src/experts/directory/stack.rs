@@ -71,6 +71,8 @@ impl LayerCurve {
 /// when its expert lies `s` or more slots deep (`Reuse::depth`).
 pub struct Stack {
     ranking: Ranking,
+    /// Map from `visit_layer` (`0..V-1`) to `physical_stack` (`0..P-1`).
+    stack_of: Vec<usize>,
     experts: usize,
     curve: MissCurve,
     /// The last decode step counted.
@@ -184,6 +186,14 @@ impl Stack {
     /// No read yet of `layers` layers of at most `experts` experts each,
     /// ranked by `ranking`, which it feeds.
     pub fn new(ranking: Ranking, layers: usize, experts: usize) -> Self {
+        Self::with_stacks(ranking, (0..layers).collect(), experts)
+    }
+
+    /// [`Self::new`] where each visit layer `v` maps to physical stack
+    /// `stack_of[v]`, feeding `ranking` by physical stack while recording
+    /// miss curves per visit layer.
+    pub fn with_stacks(ranking: Ranking, stack_of: Vec<usize>, experts: usize) -> Self {
+        let layers = stack_of.len();
         let empty = LayerCurve {
             misses: vec![0; experts + 1],
             requests: vec![0; experts + 1],
@@ -191,6 +201,7 @@ impl Stack {
         };
         Self {
             ranking,
+            stack_of,
             experts,
             curve: MissCurve {
                 steps: 0,
@@ -268,7 +279,7 @@ impl Stack {
         experts.sort_unstable();
         experts.dedup();
         let rows = keys.map(|keys| std::sync::Arc::new(keys.rows(read.layer)));
-        let normalized = RoutedRead { experts, ..read.clone() };
+        let normalized = RoutedRead { layer: self.stack_of[read.layer], experts, ..read.clone() };
         let depths = {
             let mut reuse = Reuse::feeding(&self.ranking);
             if batched {
@@ -291,13 +302,15 @@ impl Stack {
     /// than `s` deep. Each expert's depth, in slots, in `read.experts`'
     /// ascending order.
     pub fn read_group(&mut self, read: &RoutedRead, rows: Rows) -> Vec<usize> {
-        Reuse::feeding(&self.ranking).read(read, Some(std::sync::Arc::new(rows)), Evidence::Prompt)
+        let stacked = RoutedRead { layer: self.stack_of[read.layer], ..read.clone() };
+        Reuse::feeding(&self.ranking).read(&stacked, Some(std::sync::Arc::new(rows)), Evidence::Prompt)
     }
 
     /// [`Self::read_group`], deferring the group-wide `order` rebuild and
     /// `retop` until [`Self::finish_batch`].
     pub(crate) fn read_group_batched(&mut self, read: &RoutedRead, rows: Rows) -> Vec<usize> {
-        Reuse::feeding(&self.ranking).read_layer(read, Some(std::sync::Arc::new(rows)), ReadKind::Prompt)
+        let stacked = RoutedRead { layer: self.stack_of[read.layer], ..read.clone() };
+        Reuse::feeding(&self.ranking).read_layer(&stacked, Some(std::sync::Arc::new(rows)), ReadKind::Prompt)
     }
 
     /// Rebuild `order` and `top` once for every group dirtied by

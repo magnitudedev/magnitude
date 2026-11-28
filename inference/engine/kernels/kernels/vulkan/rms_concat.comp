@@ -1,0 +1,30 @@
+// rms_concat: `[RMS(a, eps) || RMS(b, eps)]` rounded to A. One workgroup per row.
+#define KERNEL_A SEISMIC_ELEMENT_A
+#include "lib/core/activation.glsl"
+#include "lib/core/reduce.glsl"
+
+void rms_concat() {
+    const uint64_t row = uint64_t(gl_WorkGroupID.x);
+    const uint64_t H = SEISMIC_DIM_H;
+    const uint thread = gl_LocalInvocationIndex;
+    const float eps = element_word_f32(SEISMIC_PARAM_EPSILON);
+    const uint64_t ar = SEISMIC_PTR(SEISMIC_BUFFER_A) + row * SEISMIC_A_STRIDE_0 * 4ul;
+    const uint64_t br = SEISMIC_PTR(SEISMIC_BUFFER_B) + row * SEISMIC_B_STRIDE_0 * 4ul;
+    float sq_a = 0.0;
+    float sq_b = 0.0;
+    seismic_strided(uint64_t, i, SEISMIC_THREAD, H, gl_WorkGroupSize.x) {
+        const float va = element_f32_at(ar + i * SEISMIC_A_STRIDE_1 * 4ul);
+        const float vb = element_f32_at(br + i * SEISMIC_B_STRIDE_1 * 4ul);
+        sq_a = seismic_fma_rn(va, va, sq_a);
+        sq_b = seismic_fma_rn(vb, vb, sq_b);
+    }
+    const float inv_a = inversesqrt(seismic_div_rn(reduce_group_sum(sq_a, 0u), float(H)) + eps);
+    const float inv_b = inversesqrt(seismic_div_rn(reduce_group_sum(sq_b, 0u), float(H)) + eps);
+    const Out result = out_offset(SEISMIC_RESULT_0_OUT, row * SEISMIC_RESULT_0_STRIDE_0);
+    for (uint64_t i = uint64_t(thread); i < H; i += uint64_t(gl_WorkGroupSize.x)) {
+        out_put(result, i * SEISMIC_RESULT_0_STRIDE_1,
+            element_f32_at(ar + i * SEISMIC_A_STRIDE_1 * 4ul) * inv_a);
+        out_put(result, (H + i) * SEISMIC_RESULT_0_STRIDE_1,
+            element_f32_at(br + i * SEISMIC_B_STRIDE_1 * 4ul) * inv_b);
+    }
+}

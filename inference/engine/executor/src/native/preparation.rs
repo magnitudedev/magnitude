@@ -544,7 +544,11 @@ impl Walks<'_> {
             readout_packed: HashSet::new(),
             epsilon: self.epsilon,
             hidden: self.definition.decoder.hidden,
-            vocabulary: self.definition.decoder.vocabulary,
+            vocabulary: self.definition.decoder.active_vocabulary(),
+            block_attn_res: matches!(
+                self.definition.decoder.residual,
+                magnitude_family_contracts::ResidualForm::BlockAttention { .. }
+            ),
             target: TargetKernels::default(),
             resident_routes: HashMap::new(),
             resident_selects: HashMap::new(),
@@ -674,6 +678,7 @@ struct Preparation<'a> {
     hidden: u64,
     /// The target's vocabulary: the static dimension of token selection.
     vocabulary: u64,
+    block_attn_res: bool,
     target: TargetKernels,
     /// The tuning case of each fused binding's resident decode route over
     /// every row it serves, whose ranges a streamed layer's route follows
@@ -956,6 +961,15 @@ impl<'a> Preparation<'a> {
         )? {
             self.target.embedding.insert(b, kernel);
         }
+        if let Some(nw) = target.entry_norm() {
+            if let Some(kernel) = spec.fixed(
+                &format!("entry_norm {nw:?}"),
+                &[],
+                post_norm_residual::native_entry_with(post_norm_residual::Elements { NW: nw }),
+            )? {
+                self.target.entry_norm.insert(nw, kernel);
+            }
+        }
         // The decoder blocks of a draft head reading target history are
         // prepared with the target's, by binding: their layers are the
         // head's.
@@ -1075,6 +1089,7 @@ impl<'a> Preparation<'a> {
         // and a walk that tunes nothing (the count, the census) must not
         // meet it again at each of them, or its launches per step would be
         // counted once per layer.
+        let is_block_attn_res = self.block_attn_res;
         let mut mixers = HashSet::new();
         let mut feeds = HashSet::new();
         for block in target.blocks().iter().chain(head_blocks) {
@@ -1082,6 +1097,7 @@ impl<'a> Preparation<'a> {
                 self.tuning.set_invocations(calls.clone(), false);
             }
             match Some(block.mixer()).filter(|slot| mixers.insert(*slot)) {
+                Some(MixerProgramSlot::Attention(_)) if is_block_attn_res => {}
                 Some(MixerProgramSlot::Attention(b)) if !self.target.attention.contains_key(&b) => {
                     if let Some(kernels) = self.attention(b, attention_layers.scopes(b))? {
                         self.target.attention.insert(b, kernels);
@@ -1297,7 +1313,7 @@ impl<'a> Preparation<'a> {
                 self.target.features.insert(b, kernel);
             }
         }
-        if let Some(taps) = target.taps() {
+        if let Some(taps) = target.taps().filter(|t| t.linear_fusion) {
             self.taps(taps)?;
         }
         Ok(())
@@ -3903,7 +3919,7 @@ impl<'a> Preparation<'a> {
                 let projection = self.projection(DenseOutputTuning {
                     down: markov.projection,
                     activation,
-                    down_kind: WeightKind::MarkovProjection,
+                    down_kind: markov.projection_kind,
                     scopes: vec![WeightScope::Draft],
                 })?;
                 match (embedding, projection) {
@@ -4250,6 +4266,15 @@ impl<'a> Preparation<'a> {
                         NW: element!(post_norm_residual, "NW"),
                     }
                 ),
+                VisionEntry::ResidualAdd => {
+                    if let Some(native) =
+                        self.spec.fixed(&label, statics, stream_join::native_entry())?
+                    {
+                        self.vision_kernels()
+                            .residual_add
+                            .insert(kernel.clone(), native);
+                    }
+                }
             }
         }
         Ok(())

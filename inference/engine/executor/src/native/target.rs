@@ -33,6 +33,7 @@ use std::ops::Range;
 pub struct TargetKernels {
     pub(super) residual_features: Option<NativeKernel<feature_rows::Entry>>,
     pub(super) embedding: HashMap<EmbeddingBinding, NativeKernel<embedding_rows::Entry>>,
+    pub(super) entry_norm: HashMap<seismic::Element, NativeKernel<post_norm_residual::Entry>>,
     pub(super) attention: HashMap<AttentionBinding, AttentionKernels>,
     pub(super) recurrent: HashMap<RecurrentBinding, RecurrentKernels>,
     pub(super) state_space: HashMap<StateSpaceBinding, StateSpaceKernels>,

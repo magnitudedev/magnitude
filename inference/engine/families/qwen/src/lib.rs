@@ -13,7 +13,8 @@ pub use projector::describe_projector;
 use magnitude_artifacts::gguf::Directory;
 use magnitude_family_common::{HeaderError, Metadata, Tensors};
 use magnitude_family_contracts::{
-    ActivationFunction, Attention, AttentionGate, DenseFfn, ExpertSelection, FeedForwardUp,
+    ActivationFunction, Attention, AttentionGate, AttentionSinks, DenseFfn, ExpertSelection,
+    FeedForwardUp,
     GateFunction, GatedDelta, HeadNorm, HistoryRows, HistorySource, MediaRowAttention,
     GateProjection, Operator, ProjectedRows, RecurrentDecay, RecurrentGate, RowProducer, RowRounding, TokenDomain, OutputProjection, QueryKeys, QueryProjection, RecurrentHeadMapping, RmsNorm,
     Rotary, RouteNormalization, RoutedFfn, Router,
@@ -278,6 +279,8 @@ impl Geometry {
                         "attn_v.weight",
                         &[product(&[kv_heads, width])?, hidden],
                     )?),
+                    key_conv: None,
+                    value_conv: None,
                     key_norm: HeadNorm::Rms(self.rms(weight("attn_k_norm.weight", &[width])?)),
                     value_norm: ValueNorm::None,
                     domain: TokenDomain::Token,
@@ -285,9 +288,11 @@ impl Geometry {
                 },
             )))],
             rotary: self.rotary.clone(),
+            relative_bias: None,
+            log_scale: None,
             scale: 1.0 / (width as f64).sqrt(),
             media_rows: MediaRowAttention::Causal,
-            sinks: None,
+            sinks: AttentionSinks::None,
             output: OutputProjection::Full(weight(
                 "attn_output.weight",
                 &[hidden, product(&[heads, width])?],

@@ -1156,6 +1156,10 @@ pub(in crate::experts) struct DecodeDmaState {
     pool: Mutex<DecodeSourcePool>,
     pool_freed: std::sync::Condvar,
     pub selected: usize,
+    /// Map from `visit_layer` (`0..V`) to `physical_stack` (`0..P`) so
+    /// `ExpertKey` in the shared transfer registry is always keyed by physical
+    /// stack, matching `LinkMover` and `Directory`.
+    stack_of: Vec<usize>,
     draft_layers: Vec<bool>,
     /// Per-layer 3-tier service prices providing `N_ce_min` (`POLICY_CE_MIN_EXPERTS`)
     /// to the device-side 3-way classifier in `routed_stage_host`.
@@ -1212,12 +1216,21 @@ impl DecodeDmaState {
             pool,
             pool_freed: std::sync::Condvar::new(),
             selected,
+            stack_of: (0..draft_layers.len()).collect(),
             draft_layers: draft_layers.to_vec(),
             tier_prices,
             files,
             file_ready,
             events,
         }
+    }
+
+    /// Set the `visit_layer -> physical_stack` map for looped architectures
+    /// whose multiple visit layers share distinct physical expert stacks.
+    pub(in crate::experts) fn with_stacks(mut self, stack_of: Vec<usize>) -> Self {
+        assert_eq!(stack_of.len(), self.draft_layers.len(), "each visit layer has a physical stack");
+        self.stack_of = stack_of;
+        self
     }
 
     /// Unified `Copies` (`IoPlane`) instance governing `CopyEngineH2D` for
@@ -2570,6 +2583,7 @@ impl ExpertTransport {
             .decode
             .as_ref()
             .ok_or("land_decode_misses_slot called without decode DMA active")?;
+        let stack = dma.stack_of[layer];
         let front = &dma.slots[slot_idx].front_sources_words;
         let back = &dma.slots[slot_idx].back_sources_words;
         let file = dma.files.get(layer);
@@ -2691,7 +2705,7 @@ impl ExpertTransport {
                     if resolved.iter().any(|&(tr, _)| tr == tier_record) {
                         continue;
                     }
-                    if let Some(joined) = self.join_by_tier_record(group, layer, tier_record) {
+                    if let Some(joined) = self.join_by_tier_record(group, stack, tier_record) {
                         resolved.push((tier_record, joined.dest.slot));
                         tx.record_joined(joined.lease, joined.sync);
                         joined_experts += 1;
@@ -2768,7 +2782,7 @@ impl ExpertTransport {
                 let mut batch_slots = Vec::with_capacity(fresh_landed.len());
                 let mut batch_leases = Vec::with_capacity(fresh_landed.len());
                 for &(tier_record, slot, staged) in &fresh_landed {
-                    let (target_layer, target_expert) = staged.unwrap_or((layer, tier_record));
+                    let (target_layer, target_expert) = staged.unwrap_or((stack, tier_record));
                     let (id, lease) = self.begin_demand_transfer(
                         group,
                         target_layer,

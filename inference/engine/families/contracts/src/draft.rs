@@ -14,9 +14,9 @@
 
 use crate::decoder::{self, Context};
 use crate::{
-    Block, Decoder, DefinitionError, HistoryRows, HyperConnectionMixing, Operator, ResidualForm,
-    RmsNorm, SublayerIndex, TokenId, WeightDescriptor, WeightKind, WeightRole, WeightScope,
-    checked_product, expect_shape,
+    Block, Decoder, DefinitionError, HeadNorm, HistoryRows, HyperConnectionMixing, Operator,
+    ResidualForm, RmsNorm, SublayerIndex, TokenId, WeightDescriptor, WeightKind, WeightRole,
+    WeightScope, checked_product, expect_shape,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -61,16 +61,99 @@ pub enum BlockAttention {
     Bidirectional,
 }
 
-/// DSpark's rank-`R` Markov bias: slot `i`'s logits gain
-/// `projection · embedding[previous_i]`, where `previous_0` is the anchor
-/// and `previous_{i+1}` is slot `i`'s selection.
+/// DSpark's sequential Markov head over block slots.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct MarkovHead {
+pub enum MarkovHead {
+    /// Bilinear rank-`R` bias: slot `i`'s logits gain
+    /// `projection · embedding[previous_i]`, where `previous_0` is the anchor
+    /// and `previous_{i+1}` is slot `i`'s selection.
+    Bilinear {
+        rank: u64,
+        /// `[vocabulary, rank]`.
+        embedding: WeightDescriptor,
+        /// `[vocabulary, rank]`.
+        projection: WeightDescriptor,
+    },
+    /// Recurrent hidden-state Markov head (`rnn_hidden`): maintains a rank-`R`
+    /// recurrent state updated per slot via `rnn_proj` over `[h_prev ;
+    /// embedding[previous_i] ; hidden_i ; f_rnn]`, then maps the updated state
+    /// to hidden space via `hidden_out` (which folds into the readout
+    /// vocabulary projection).
+    RnnHidden(RnnMarkovHead),
+}
+
+impl MarkovHead {
+    pub fn rank(&self) -> u64 {
+        match self {
+            Self::Bilinear { rank, .. } => *rank,
+            Self::RnnHidden(rnn) => rnn.rank,
+        }
+    }
+}
+
+/// Recurrent hidden-state Markov head (`rnn_hidden`, Inkling 2 DSpark).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RnnMarkovHead {
     pub rank: u64,
-    /// `[vocabulary, rank]`.
+    /// `[vocabulary, rank]` (`markov_w1`).
     pub embedding: WeightDescriptor,
-    /// `[vocabulary, rank]`.
-    pub projection: WeightDescriptor,
+    /// `[3·rank, 2·rank + 2·hidden]` (`rnn_proj`).
+    pub rnn_proj: Affine,
+    /// `[hidden, rank]` weight and `[hidden]` bias (`hidden_out`).
+    pub hidden_out: Affine,
+}
+
+/// How the tapped target residuals become the draft's context feature(s).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum DraftFusion {
+    /// Concatenate all `taps` target residuals and project through
+    /// `projection` (`[hidden, taps·hidden]`), then `norm` (`[hidden]`),
+    /// producing one shared context feature per token.
+    Linear {
+        projection: WeightDescriptor,
+        norm: RmsNorm,
+    },
+    /// Per-output softmax-weighted combination of the `taps` target residuals
+    /// (`weights` `[outputs, taps]`, softmaxed over `taps`), each normalized
+    /// by its own `RmsNorm` (`norms`, length `outputs`, `[hidden]` each),
+    /// producing one context feature per draft layer (plus one extra feature
+    /// `f_rnn` when using [`MarkovHead::RnnHidden`]).
+    SoftmaxMix {
+        weights: WeightDescriptor,
+        norms: Vec<RmsNorm>,
+    },
+}
+
+impl DraftFusion {
+    pub fn norms(&self) -> &[RmsNorm] {
+        match self {
+            Self::Linear { norm, .. } => std::slice::from_ref(norm),
+            Self::SoftmaxMix { norms, .. } => norms.as_slice(),
+        }
+    }
+}
+
+/// How the draft block's mask slots (slots `1..block_size`) are initialized.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum DraftMask {
+    /// Every mask slot reads this token's row from the draft's embedding table.
+    Token(TokenId),
+    /// Learned mask embedding vector `[hidden]` broadcast to all
+    /// `block_size - 1` mask slots (`mask_embd.weight`).
+    Learned(WeightDescriptor),
+}
+
+/// Separate key/value projection and key normalization applied to the fused
+/// target context features entering a draft layer's history (when distinct
+/// from the layer's block-row K/V projections).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DraftContextProjection {
+    /// `[kv_heads·width, hidden]`.
+    pub key: WeightDescriptor,
+    /// `[kv_heads·width, hidden]`.
+    pub value: WeightDescriptor,
+    /// Per-head key norm over `width`.
+    pub key_norm: HeadNorm,
 }
 
 /// DSpark's acceptance estimate of slot `i`:
@@ -499,10 +582,10 @@ pub struct CandidateSelector {
 pub enum DraftMethod {
     /// Every slot's proposal is its own argmax.
     DFlash,
-    /// Slots chain through the Markov bias and carry a confidence.
+    /// Slots chain through the Markov bias and optionally carry a confidence.
     DSpark {
         markov: MarkovHead,
-        confidence: ConfidenceHead,
+        confidence: Option<ConfidenceHead>,
     },
     /// Proposals follow an ordered candidate path over a convolved backbone.
     DFlash2 { selector: CandidateSelector },
@@ -560,11 +643,12 @@ impl DraftMethod {
 pub struct DraftDefinition {
     pub method: DraftMethod,
     /// Target residuals in fusion column order: tap `t` owns columns
-    /// `[t·hidden, (t + 1)·hidden)` of `fusion`.
+    /// `[t·hidden, (t + 1)·hidden)` of `DraftFusion::Linear`, or tap column
+    /// `t` of `DraftFusion::SoftmaxMix`.
     pub taps: Vec<TapPoint>,
-    /// `[hidden, taps·hidden]`.
-    pub fusion: WeightDescriptor,
-    pub fusion_norm: RmsNorm,
+    /// How tapped target residuals are fused and normalized into draft context
+    /// feature(s).
+    pub fusion: DraftFusion,
     pub embedding: DraftEmbedding,
     /// Own full-vocabulary projection; absent means the target projection is shared.
     pub output: Option<WeightDescriptor>,
@@ -578,6 +662,11 @@ pub struct DraftDefinition {
     pub blocks: Vec<Block>,
     /// One per draft layer: how its block rows attend the block.
     pub block_attention: Vec<BlockAttention>,
+    /// Optional per-layer separate K/V projections and K-norm for injected
+    /// target context features (`kv_proj_ctx` / `k_norm_ctx`). When absent,
+    /// each draft layer reuses its own block-row K/V projections and K-norm.
+    #[serde(default)]
+    pub context_projections: Option<Vec<DraftContextProjection>>,
     /// The convolutions wrapping every draft sublayer of a convolved
     /// backbone.
     pub convolutions: Option<BlockConvolutions>,
@@ -588,7 +677,9 @@ pub struct DraftDefinition {
     /// Rows of the trained draft block, anchor included: the widest block a
     /// pass runs (`block_rows`).
     pub block_size: u64,
-    pub mask_token: TokenId,
+    /// How mask slots (`1..block_size`) are initialized: a vocabulary token or
+    /// per-slot learned embeddings (`mask_embed`).
+    pub mask: DraftMask,
     pub layout: BlockLayout,
 }
 
@@ -648,10 +739,17 @@ impl DraftDefinition {
                 "draft block attention differs from its layer count",
             ));
         }
-        if u64::from(self.mask_token.0) >= decoder.vocabulary {
-            return Err(DefinitionError::new(
-                "draft mask token is outside the vocabulary",
-            ));
+        match &self.mask {
+            DraftMask::Token(token) => {
+                if u64::from(token.0) >= decoder.vocabulary {
+                    return Err(DefinitionError::new(
+                        "draft mask token is outside the vocabulary",
+                    ));
+                }
+            }
+            DraftMask::Learned(embedding) => {
+                expect_shape(embedding, &[hidden], "draft mask embedding")?;
+            }
         }
         for (index, tap) in self.taps.iter().enumerate() {
             if self.taps[..index].contains(tap) {
@@ -668,7 +766,7 @@ impl DraftDefinition {
             }
         }
         match &self.residual {
-            ResidualForm::Single => {}
+            ResidualForm::Single | ResidualForm::BlockAttention { .. } => {}
             ResidualForm::HyperConnections(form) => {
                 if form.streams == 0 {
                     return Err(DefinitionError::new(
@@ -699,9 +797,36 @@ impl DraftDefinition {
                 }
             }
         }
-        let fused = checked_product(&[self.taps.len() as u64, hidden])?;
-        expect_shape(&self.fusion, &[hidden, fused], "draft fusion projection")?;
-        decoder::validate_rms(&self.fusion_norm, hidden, "draft fusion norm")?;
+        match &self.fusion {
+            DraftFusion::Linear { projection, norm } => {
+                let fused = checked_product(&[self.taps.len() as u64, hidden])?;
+                expect_shape(projection, &[hidden, fused], "draft fusion projection")?;
+                decoder::validate_rms(norm, hidden, "draft fusion norm")?;
+            }
+            DraftFusion::SoftmaxMix { weights, norms } => {
+                let extra = usize::from(matches!(
+                    self.method,
+                    DraftMethod::DSpark {
+                        markov: MarkovHead::RnnHidden(_),
+                        ..
+                    }
+                ));
+                let outputs = (self.blocks.len() + extra) as u64;
+                expect_shape(
+                    weights,
+                    &[outputs, self.taps.len() as u64],
+                    "draft fusion weights",
+                )?;
+                if norms.len() as u64 != outputs {
+                    return Err(DefinitionError::new(
+                        "draft fusion norms differ from its output count",
+                    ));
+                }
+                for norm in norms {
+                    decoder::validate_rms(norm, hidden, "draft fusion norm")?;
+                }
+            }
+        }
         if let DraftEmbedding::Own(table) = &self.embedding {
             expect_shape(
                 table,
@@ -743,24 +868,80 @@ impl DraftDefinition {
                 }
             }
         }
+        if let Some(projections) = &self.context_projections {
+            if projections.len() != self.blocks.len() {
+                return Err(DefinitionError::new(
+                    "draft context projections differ from its layer count",
+                ));
+            }
+            for (block, projection) in self.blocks.iter().zip(projections) {
+                let attention = block
+                    .sublayers
+                    .iter()
+                    .find_map(|sublayer| match &sublayer.op {
+                        Operator::Attention(attention) => Some(attention.as_ref()),
+                        _ => None,
+                    })
+                    .ok_or_else(|| {
+                        DefinitionError::new(
+                            "draft context projection on a block without attention",
+                        )
+                    })?;
+                let kv_rows = checked_product(&[attention.kv_heads, attention.width])?;
+                expect_shape(&projection.key, &[kv_rows, hidden], "draft context key")?;
+                expect_shape(&projection.value, &[kv_rows, hidden], "draft context value")?;
+                decoder::validate_head_norm(
+                    &projection.key_norm,
+                    attention.kv_heads,
+                    attention.width,
+                    "draft context key norm",
+                )?;
+            }
+        }
         decoder::validate_rms(&self.output_norm, hidden, "draft output norm")?;
         match &self.method {
             DraftMethod::DFlash => {}
             DraftMethod::DSpark { markov, confidence } => {
-                if markov.rank == 0 {
+                let rank = markov.rank();
+                if rank == 0 {
                     return Err(DefinitionError::new("draft Markov head has no rank"));
                 }
-                let table = [decoder.vocabulary, markov.rank];
-                expect_shape(&markov.embedding, &table, "draft Markov embedding")?;
-                expect_shape(&markov.projection, &table, "draft Markov projection")?;
-                let joined = hidden
-                    .checked_add(markov.rank)
-                    .ok_or_else(|| DefinitionError::new("draft confidence width overflows"))?;
-                if confidence.weight.shape != [joined] && confidence.weight.shape != [1, joined] {
-                    return Err(DefinitionError::new("draft confidence weight shape"));
+                match markov {
+                    MarkovHead::Bilinear {
+                        embedding,
+                        projection,
+                        ..
+                    } => {
+                        let table = [decoder.vocabulary, rank];
+                        expect_shape(embedding, &table, "draft Markov embedding")?;
+                        expect_shape(projection, &table, "draft Markov projection")?;
+                    }
+                    MarkovHead::RnnHidden(rnn) => {
+                        let table = [decoder.vocabulary, rank];
+                        expect_shape(&rnn.embedding, &table, "draft Markov embedding")?;
+                        let rnn_out = checked_product(&[3, rank])?;
+                        let rnn_in = checked_product(&[2, rank])?
+                            .checked_add(checked_product(&[2, hidden])?)
+                            .ok_or_else(|| {
+                                DefinitionError::new("draft Markov RNN input width overflows")
+                            })?;
+                        rnn.rnn_proj
+                            .validate(rnn_out, rnn_in, "draft Markov RNN projection")?;
+                        rnn.hidden_out
+                            .validate(hidden, rank, "draft Markov hidden output")?;
+                    }
                 }
-                if let Some(bias) = &confidence.bias {
-                    expect_shape(bias, &[1], "draft confidence bias")?;
+                if let Some(confidence) = confidence {
+                    let joined = hidden
+                        .checked_add(rank)
+                        .ok_or_else(|| DefinitionError::new("draft confidence width overflows"))?;
+                    if confidence.weight.shape != [joined] && confidence.weight.shape != [1, joined]
+                    {
+                        return Err(DefinitionError::new("draft confidence weight shape"));
+                    }
+                    if let Some(bias) = &confidence.bias {
+                        expect_shape(bias, &[1], "draft confidence bias")?;
+                    }
                 }
             }
             DraftMethod::DFlash2 { selector } => {

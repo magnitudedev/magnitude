@@ -311,7 +311,8 @@ impl HostArtifacts {
             .and_then(ByteBpeTokenizer::new)
             .map_err(|error| ResolveError::Unsupported(error.into()))?,
         );
-        if u64::try_from(tokenizer.vocabulary()).ok() != Some(definition.decoder.vocabulary) {
+        if u64::try_from(tokenizer.vocabulary()).ok() != Some(definition.decoder.active_vocabulary())
+        {
             return Err(ResolveError::Unsupported(vocabulary_mismatch(
                 package.tokenizer(),
             )));

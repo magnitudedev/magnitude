@@ -9,8 +9,9 @@ use crate::{
     programs::graph::GraphError,
     stored_table::SelectionNotice,
 };
-use magnitude_family_contracts::{Decoder, EmbeddingScale, WeightKind, WeightRole, WeightScope};
-use magnitude_kernels::{embedding_rows, selection_notice};
+use magnitude_family_contracts::{Decoder, EmbeddingScale, EntryNorm, WeightKind, WeightRole, WeightScope};
+use magnitude_kernels::{embedding_rows, post_norm_residual, selection_notice};
+use crate::programs::native_constants::GraphConstant;
 #[cfg(test)]
 use seismic::{NativeGraphMetadata, NativeGraphStorageBytes};
 use seismic::{
@@ -116,6 +117,10 @@ pub(crate) struct PreparedTargetEntryGraph {
     /// Of a step reading selected tokens of a table with landing slots: its
     /// landed read's ports.
     pub landed: Option<LandedReadPorts>,
+    /// Optional weighted entry RMSNorm port (`EntryNorm::Rms`).
+    pub entry_norm: Option<NativePort>,
+    /// Static host constants for `entry_norm`.
+    pub constants: Vec<GraphConstant>,
 }
 
 /// An entry graph's kept token rows (`ModelLoadPlan::keeps_token_rows`):
@@ -143,17 +148,33 @@ impl PreparedTargetEntryGraph {
     pub(super) fn prepare(
         device: &Device,
         embedding: &seismic::NativeKernel<embedding_rows::Entry>,
+        entry_norm: Option<&seismic::NativeKernel<post_norm_residual::Entry>>,
         copy: Option<&seismic::NativeKernel<selection_notice::Entry>>,
         landing: Option<&crate::native::AttestedLanding>,
         load: &ModelLoadPlan,
         geometry: &Decoder,
         rows: u64,
         source: EntryTokens,
-        layout: &NativeGraphLayout,
+        layout: Option<&NativeGraphLayout>,
     ) -> Result<Self, String> {
+        let entry_norm_view = match &geometry.entry.norm {
+            Some(EntryNorm::Rms { norm, .. }) => {
+                let kernel = entry_norm.ok_or("weighted entry norm without its kernel")?;
+                let view = target_view(load, WeightKind::EntryNorm)?;
+                Some((kernel, view, norm.epsilon as f32))
+            }
+            _ => None,
+        };
+        let graph = match layout {
+            Some(layout) => device.native_graph_with_layout(layout),
+            None => device.native_graph(),
+        };
         let draft = entry_graph_topology(
-            device.native_graph_with_layout(layout),
+            graph,
             embedding,
+            entry_norm_view
+                .as_ref()
+                .map(|(kernel, view, eps)| (*kernel, view, *eps)),
             copy,
             load.notifies_selection(),
             landing.map(LandingEntries::native),
@@ -175,6 +196,8 @@ impl PreparedTargetEntryGraph {
             kept_tokens: draft.kept_tokens,
             kept_guesses: draft.kept_guesses,
             landed: draft.landed,
+            entry_norm: draft.entry_norm,
+            constants: draft.constants,
         })
     }
 }
@@ -224,25 +247,15 @@ pub(super) struct EntryGraphDraft<G> {
     kept_tokens: Option<KeptTokens>,
     kept_guesses: Option<KeptTokens>,
     landed: Option<LandedReadPorts>,
+    entry_norm: Option<NativePort>,
+    constants: Vec<GraphConstant>,
 }
 
-/// The entry graph: the step's token rows embedded, `copy` the token row
-/// copy entry of a model that copies them
-/// (`ModelLoadPlan::copies_token_rows`). Where it
-/// `notifies` (a model with a stored table) it copies selected tokens for
-/// the host first. With
-/// `keeps_tokens` (a model whose blocks read the step's token rows) the
-/// host's uploaded tokens are copied into the bound token rows
-/// (`keep_tokens`), so later graphs read a device tensor of the step's token
-/// rows whatever their source, as they read a selection. With
-/// `keeps_guesses` (a load that fronts, which keeps its token rows) the
-/// host's guesses of a step of its tokens are kept alike, for its step words.
-/// Selected tokens of a table with landing slots are a landed read
-/// (`landed_read`, `landing`).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn entry_graph_topology<'a, G: GraphDraft + 'a>(
     mut graph: G,
     embedding: G::Binding<'a, embedding_rows::Entry>,
+    entry_norm: Option<(G::Binding<'a, post_norm_residual::Entry>, &WeightView, f32)>,
     copy: Option<G::Binding<'a, selection_notice::Entry>>,
     notifies: bool,
     landing: Option<LandingEntries<'a, G>>,
@@ -339,17 +352,53 @@ pub(super) fn entry_graph_topology<'a, G: GraphDraft + 'a>(
         }
         _ => (embed(&mut graph)?, None),
     };
-    graph.export(&result.r1)?;
+    let mut constants = Vec::new();
+    let (hidden, entry_norm_port) = match entry_norm {
+        Some((norm_kernel, norm_view, norm_eps)) => {
+            let norm_port = graph.weight_port(norm_view.resident, &norm_view.shape)?;
+            let zero_residual = GraphConstant::row_zeros(
+                &mut graph,
+                Element::f32(),
+                rows.clone(),
+                width.hidden.clone(),
+                Some("O"),
+            )?;
+            let identity_rows = GraphConstant::row_identity(&mut graph, rows.clone(), Some("O"))?;
+            let zero_res_view = zero_residual.port().tensor().clone();
+            let identity_view = identity_rows.port().tensor().clone();
+            constants.push(zero_residual);
+            constants.push(identity_rows);
+            let normalized = graph
+                .enqueue::<post_norm_residual::Entry>(
+                    norm_kernel,
+                    &[("M", rows), ("O", rows), ("D", width.hidden)],
+                    post_norm_residual::WorkflowArgs {
+                        residual: (&zero_res_view).into(),
+                        projected: (&result.r1).into(),
+                        norm: norm_port.tensor().into(),
+                        out_rows: (&identity_view).into(),
+                        epsilon: norm_eps.into(),
+                        scale: 1.0f32.into(),
+                    },
+                )?
+                .value;
+            (normalized, Some(norm_port))
+        }
+        None => (result.r1, None),
+    };
+    graph.export(&hidden)?;
     Ok(EntryGraphDraft {
         graph,
         table,
         directory,
         tokens,
-        hidden: result.r1,
+        hidden,
         notice,
         kept_tokens,
         kept_guesses,
         landed,
+        entry_norm: entry_norm_port,
+        constants,
     })
 }
 
@@ -383,11 +432,27 @@ pub(super) fn certify_entry<L: Certified>(
 ) -> Result<L, GraphError> {
     let weight = load.weight(TARGET_TABLE)?;
     let elements = [("EW", weight.resident), ("A", activation(geometry))];
+    let entry_norm_view = match &geometry.entry.norm {
+        Some(EntryNorm::Rms { norm, .. }) => {
+            let view = load.weight(WeightRole {
+                scope: WeightScope::Target,
+                kind: WeightKind::EntryNorm,
+            })?;
+            Some((view, norm.epsilon as f32))
+        }
+        _ => None,
+    };
+    let entry_norm_elements = entry_norm_view
+        .as_ref()
+        .map(|(view, _)| [("NW", view.resident)]);
     let landing = CheckedLandingEntries::of(load, TARGET_TABLE)?;
     let (layout, _) = L::certify_group(backend, row_classes, |draft, rows| {
         let built = entry_graph_topology(
             draft,
             L::Draft::bind(&elements),
+            entry_norm_view.as_ref().zip(entry_norm_elements.as_ref()).map(
+                |((view, eps), els)| (L::Draft::bind(els), view, *eps),
+            ),
             load.copies_token_rows().then(|| L::Draft::bind(&[][..])),
             load.notifies_selection(),
             landing.as_ref().map(CheckedLandingEntries::entries),
@@ -430,9 +495,11 @@ pub(crate) fn embedding_transform(geometry: &Decoder) -> (f32, i32, f32) {
         EmbeddingScale::Unit => 1.0,
         EmbeddingScale::SqrtHidden => (geometry.hidden as f32).sqrt(),
     };
-    match geometry.entry.norm {
-        Some(norm) => (scale, 1, norm.epsilon as f32),
-        None => (scale, 0, 0.0),
+    match &geometry.entry.norm {
+        Some(magnitude_family_contracts::EntryNorm::Unweighted(norm)) => {
+            (scale, 1, norm.epsilon as f32)
+        }
+        Some(magnitude_family_contracts::EntryNorm::Rms { .. }) | None => (scale, 0, 0.0),
     }
 }
 
@@ -446,10 +513,26 @@ pub(crate) fn checked_entry_graph_storage(
 ) -> Result<NativeGraphStorageBytes, GraphError> {
     let weight = load.weight(TARGET_TABLE)?;
     let elements = [("EW", weight.resident), ("A", activation(geometry))];
+    let entry_norm_view = match &geometry.entry.norm {
+        Some(EntryNorm::Rms { norm, .. }) => {
+            let view = load.weight(WeightRole {
+                scope: WeightScope::Target,
+                kind: WeightKind::EntryNorm,
+            })?;
+            Some((view, norm.epsilon as f32))
+        }
+        _ => None,
+    };
+    let entry_norm_elements = entry_norm_view
+        .as_ref()
+        .map(|(view, _)| [("NW", view.resident)]);
     let landing = CheckedLandingEntries::of(load, TARGET_TABLE)?;
     let draft = entry_graph_topology(
         NativeGraphMetadata::new(backend),
         &elements,
+        entry_norm_view.as_ref().zip(entry_norm_elements.as_ref()).map(
+            |((view, eps), els)| (&els[..], view, *eps),
+        ),
         load.copies_token_rows().then_some(&[][..]),
         load.notifies_selection(),
         landing.as_ref().map(CheckedLandingEntries::entries),

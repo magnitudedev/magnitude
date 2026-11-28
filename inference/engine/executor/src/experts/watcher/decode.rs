@@ -64,6 +64,7 @@ struct Watched {
     file: ExchangeTable,
     policy: Words,
     experts: usize,
+    stack: usize,
 }
 
 /// The request service's look at the device's decode requests, taken
@@ -121,7 +122,7 @@ impl Look {
             layers: core
                 .layers
                 .iter()
-                .map(|layer| Watched { file: layer.file.clone(), policy: layer.policy.clone(), experts: layer.experts })
+                .map(|layer| Watched { file: layer.file.clone(), policy: layer.policy.clone(), experts: layer.experts, stack: layer.stack })
                 .collect(),
             words: core.extents.words,
             table: core.table.clone(),
@@ -228,7 +229,7 @@ impl Look {
             if free.is_empty() {
                 break;
             }
-            if !self.inbound.claim((layer, expert)) {
+            if !self.inbound.claim((watched.stack, expert)) {
                 continue;
             }
             claimed.push((expert, free.pop().expect("a free record, looked at above")));
@@ -383,14 +384,14 @@ pub(super) fn parked_reads(core: &Core, shared: &Shared, layer: usize, sequence:
 /// the park may name ([`parked_reads`]), nor a request's outstanding answer
 /// (`HostRecords::answer`). The record taken answers the parked request
 /// once it lands. None once the parked step ended: nothing waits on it.
-fn demand_claim(core: &mut Core, shared: &Shared, staged: Staged, demand: Demand, park: &Park) -> Option<Claim> {
-    let read = parked_reads(core, shared, staged.0, park.point.sequence)?;
+fn demand_claim(core: &mut Core, shared: &Shared, (layer, expert): Staged, demand: Demand, park: &Park) -> Option<Claim> {
+    let read = parked_reads(core, shared, layer, park.point.sequence)?;
     core.directory.release(park, &read);
-    let claim = core.directory.claim_demand(staged, demand, &read, park);
+    let claim = core.directory.claim_demand((core.stack(layer), expert), demand, &read, park);
     if let Claim::Taken(ref grant) = claim {
         shared
             .transport
-            .bump_source_generation(core.layers[staged.0].group, grant.record() as usize);
+            .bump_source_generation(core.layers[layer].group, grant.record() as usize);
     }
     Some(claim)
 }
@@ -413,7 +414,7 @@ fn posted_claim(core: &mut Core, shared: &Shared, staged: Staged, park: &Park) -
 /// none. Until then the record stays taken, so the load's traffic is not
 /// quiet (`Prefetch::outstanding`).
 fn give_up(core: &mut Core, prefetch: &Prefetch, shared: &Shared, (layer, expert): Staged, record: u32, posting: Option<Posting>) {
-    core.directory.unposted(layer, expert);
+    core.directory.unposted(core.stack(layer), expert);
     let (staging, events) = (prefetch.staging.clone(), shared.events().clone());
     let free = move || {
         staging.release(record);
@@ -529,12 +530,13 @@ impl Decode {
         let mut index = 0;
         while let Some(waits) = waiting.get(index) {
             let (layer, expert) = (waits.at.point.layer, waits.expert);
+            let stack = core.stack(layer);
             let staged = (layer, expert);
-            match core.directory.located(layer, expert) {
+            match core.directory.located(stack, expert) {
                 // Kept already (landed meanwhile by its read ahead), or
                 // graced, taken back as it was: answered with its record.
                 Located::Kept(tier) | Located::Graced(tier) => {
-                    core.directory.answer(layer, HostRecord(tier), waits.at.point);
+                    core.directory.answer(stack, HostRecord(tier), waits.at.point);
                     waiting.remove(index).answer.publish(Some(tier));
                     progressed = true;
                     continue;
@@ -599,7 +601,7 @@ impl Decode {
                 // The read was never made: as a failed read, only the rows that named the
                 // expert fail, and its wait is answered with none, so the rest of the step serves.
                 Err(reason) => {
-                    core.directory.unlanded(layer, HostRecord(tier));
+                    core.directory.unlanded(stack, HostRecord(tier));
                     prefetch.staging.release(record);
                     shared.steps.fail_request_rows(naming.sequence, layer, &waits.rows, reason);
                     waits.answer.publish(None);
@@ -660,8 +662,9 @@ impl Decode {
         let mut plans = Vec::with_capacity(absent.len());
         let mut lead: Option<u64> = None;
         let record_bytes = core.layers[layer].expert_bytes();
+        let stack = core.stack(layer);
         for &expert in &absent {
-            let staged = (layer, expert);
+            let staged = (stack, expert);
             let mut taken_from = |from: At| {
                 let layers = from.runs_until(at);
                 lead = Some(lead.map_or(layers, |lead| lead.min(layers)));
@@ -671,14 +674,14 @@ impl Decode {
                     shared.telemetry.engagement().record_exposed(record_bytes);
                     (Plan::Posted, Some(Anticipation::Demand))
                 }
-                false => match core.directory.located(layer, expert) {
+                false => match core.directory.located(stack, expert) {
                     // Kept already: landed after the route resolved it (a
                     // read ahead's that ended and settled since), or graced
                     // since and taken back as it was ([`HostRecords::answer`]):
                     // answered with its record, an outstanding answer from
                     // now, which no claim of the request's other misses takes.
                     Located::Kept(tier) | Located::Graced(tier) => {
-                        core.directory.answer(layer, HostRecord(tier), point);
+                        core.directory.answer(stack, HostRecord(tier), point);
                         if let Some(lp) = prefetch.take_landed_prefetch(staged) {
                             shared.telemetry.engagement().record_landed_hit(lp.bytes, lp.carryover);
                         }
@@ -817,7 +820,7 @@ impl Decode {
         // Off the parked request's critical path (landings, answers and
         // reads are now in flight): prepare victims for subsequent requests.
         if has_read {
-            core.directory.prepare_demand(layer, 2 * width as usize, sequence);
+            core.directory.prepare_demand(stack, 2 * width as usize, sequence);
         }
     }
 }

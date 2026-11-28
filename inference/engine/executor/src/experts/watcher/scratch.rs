@@ -767,14 +767,14 @@ impl Lease<'_> {
 /// remain resident hits while leased records of the lender are asserted absent.
 fn mapped_hit(core: &Core, layer: usize, expert: usize, step: Step) -> bool {
     match core.extents.placer {
-        crate::planning::Placer::Tier => core.directory.resolve(layer, expert, step).is_some(),
+        crate::planning::Placer::Tier => core.directory.resolve(core.stack(layer), expert, step).is_some(),
         crate::planning::Placer::Bank => core.layers[layer].map.resolve(expert, step).is_some(),
     }
 }
 
 fn hit(core: &Core, layer: usize, expert: usize, step: Step, lease: Lease<'_>) -> Option<usize> {
     match core.extents.placer {
-        crate::planning::Placer::Tier => core.directory.resolve(layer, expert, step).map(BankRecord::index),
+        crate::planning::Placer::Tier => core.directory.resolve(core.stack(layer), expert, step).map(BankRecord::index),
         crate::planning::Placer::Bank => {
             let record = core.layers[layer].map.resolve(expert, step)?;
             let group = core.layers[layer].group;
@@ -1257,6 +1257,13 @@ impl Scratch {
         self.conveyor.serving.is_some_and(|serving| serving.past)
     }
 
+    /// Whether the conveyor holds any NVMe-read expert awaiting a `HostTier`
+    /// landing claim (used under `tier_copy_dma` to reclaim host-tier slots
+    /// even when `refill_short()` is gated by VRAM holdings or graces).
+    pub(super) fn has_held_demand(&self) -> bool {
+        !self.conveyor.held_without_landing().is_empty()
+    }
+
     /// Layer `layer`'s next `(place, window, step)` taken and not yet served,
     /// in `(set, window, place)` device order, left in its tier until its
     /// last window is taken; none while there is none, those of steps ended
@@ -1395,7 +1402,7 @@ impl Scratch {
         let (released_records, first_error, progressed) =
             self.ring.settle_copies(|ticket| copier.copies.completed(ticket));
         for (layer, record) in released_records {
-            core.directory.unhold_tier(layer, record);
+            core.directory.unhold_tier(core.stack(layer), record);
         }
         if let Some(error) = first_error {
             shared.end_serving(format!("a prefill scratch fill copy: {error}"));
@@ -1525,7 +1532,7 @@ impl Scratch {
         self.conveyor.clear();
         // The device is past every tier copy of the group.
         for (layer, record) in self.held.drain(..) {
-            core.directory.unhold_tier(layer, record);
+            core.directory.unhold_tier(core.stack(layer), record);
         }
         debug_assert!(!self.ring.has_quarantined(), "has_unretired() blocks quarantined generations");
         core.directory.end_prompt_group(self.conveyor.lending().group);
@@ -1625,6 +1632,7 @@ impl Scratch {
             .collect::<Vec<_>>();
         {
             let tier = &mut self.tiers[index];
+            let stack = core.stack(layer);
             for (expert, &flag) in flags.iter().enumerate() {
                 if flag > 0 {
                     tier.record_route(expert, flag, sequence);
@@ -1633,7 +1641,7 @@ impl Scratch {
                     // taking ranks each beside this read, a use at this step,
                     // so the landings and seeds rank the layer's experts by
                     // the prompt's use as its pass resolves, never by index.
-                    core.directory.read_pending(layer, expert, sequence);
+                    core.directory.read_pending(stack, expert, sequence);
                 }
             }
             tier.taken += 1;
@@ -1880,9 +1888,10 @@ impl Scratch {
                                 {
                                     break;
                                 }
-                                if core.directory.held(next_layer, expert).is_some()
-                                    || core.directory.tier_record(next_layer, expert).is_some()
-                                    || core.directory.lands(next_layer, expert)
+                                let next_stack = core.stack(next_layer);
+                                if core.directory.held(next_stack, expert).is_some()
+                                    || core.directory.tier_record(next_stack, expert).is_some()
+                                    || core.directory.lands(next_stack, expert)
                                     || self.conveyor.state(next_layer, expert).is_some()
                                 {
                                     continue;
@@ -2076,7 +2085,7 @@ impl Scratch {
     fn waits(&self, core: &Core, tier: &Tier, set_idx: usize, expert: usize) -> bool {
         tier.sets[set_idx].experts[expert].round().is_none()
             && copies_from_tier(core)
-            && self.conveyor.serving.is_some_and(|serving| core.directory.tier_serves(tier.layer, expert, serving.group.last()))
+            && self.conveyor.serving.is_some_and(|serving| core.directory.tier_serves(core.stack(tier.layer), expert, serving.group.last()))
     }
 
     /// Whether the conveyor carries `staged`: a read of it, or its record,
@@ -2092,7 +2101,7 @@ impl Scratch {
     pub(super) fn awaited<'a>(&'a self, core: &'a Core) -> impl Iterator<Item = Staged> + 'a {
         self.tiers.iter().flat_map(move |tier| {
             tier.deferred_experts()
-                .filter(move |&(set_idx, expert)| self.waits(core, tier, set_idx, expert) && core.directory.lands(tier.layer, expert))
+                .filter(move |&(set_idx, expert)| self.waits(core, tier, set_idx, expert) && core.directory.lands(core.stack(tier.layer), expert))
                 .map(move |(_, expert)| (tier.layer, expert))
         })
     }
@@ -2146,14 +2155,15 @@ impl Scratch {
                 }
                 continue;
             }
+            let stack = core.stack(layer);
             if !async_dma {
                 let knee_records = knee.div_ceil(core.layers[layer].expert_bytes()) as usize;
                 let free = self.conveyor.free_conveyor(layer, |r| Self::admits_conveyor(&self.conveyor, core, layer, r)).len();
-                if free <= knee_records && !(total_conveyor > knee_records && core.directory.host_has_free_slot(layer)) {
+                if free <= knee_records && !(total_conveyor > knee_records && core.directory.host_has_free_slot(stack)) {
                     continue;
                 }
             }
-            let grant = match core.directory.claim_conveyed(layer, expert, read) {
+            let grant = match core.directory.claim_conveyed(stack, expert, read) {
                 Claim::Taken(grant) => grant,
                 Claim::Kept(_) | Claim::Landing => {
                     if async_dma {
@@ -2166,7 +2176,7 @@ impl Scratch {
                 Claim::Short if async_dma && is_demand => {
                     // Active prefill demand must always land into `HostTier`
                     // so `PrefillFill` async DMA can deliver it to `ScratchRing`.
-                    match core.directory.claim_landing(layer, expert, 0, Taking::Out, (|_, _| (), |_, _| true)) {
+                    match core.directory.claim_landing(stack, expert, 0, Taking::Out, (|_, _| (), |_, _| true)) {
                         Claim::Taken(grant) => grant,
                         Claim::Kept(_) | Claim::Landing => {
                             self.conveyor.release_held(layer, expert);
@@ -2217,13 +2227,13 @@ impl Scratch {
         for landing in &landed {
             match landing.ended.get() {
                 Some(true) => {
-                    core.directory.landed(landing.layer, HostRecord(landing.tier), landing.expert, landing.read);
+                    core.directory.landed(core.stack(landing.layer), HostRecord(landing.tier), landing.expert, landing.read);
                     if async_dma {
                         self.conveyor.release_held(landing.layer, landing.expert);
                     }
                 }
                 Some(false) => {
-                    core.directory.unlanded(landing.layer, HostRecord(landing.tier));
+                    core.directory.unlanded(core.stack(landing.layer), HostRecord(landing.tier));
                     if async_dma {
                         self.conveyor.release_held(landing.layer, landing.expert);
                     }
@@ -2293,13 +2303,14 @@ impl Scratch {
             return None;
         }
         let mut needed = std::collections::BTreeSet::<u32>::new();
-        let mut layer_missing = vec![0usize; core.layers.len()];
+        let mut stack_missing = vec![0usize; core.stack_visits.len()];
         let mut max_missing = 0usize;
-        for (layer_idx, layer) in core.layers.iter().enumerate() {
+        for stack in 0..core.stack_visits.len() {
+            let layer = &core.layers[core.stack_rep(stack)];
             let lw = layer.layer_window;
             for expert in 0..layer.experts {
-                if !matches!(core.directory.located(layer_idx, expert), crate::experts::host_records::Located::Kept(_)) {
-                    layer_missing[layer_idx] += 1;
+                if !matches!(core.directory.located(stack, expert), crate::experts::host_records::Located::Kept(_)) {
+                    stack_missing[stack] += 1;
                     for r in lending.scratch_records(expert % lw) {
                         if r < lent {
                             needed.insert(r as u32);
@@ -2307,7 +2318,7 @@ impl Scratch {
                     }
                 }
             }
-            max_missing = max_missing.max(layer_missing[layer_idx]);
+            max_missing = max_missing.max(stack_missing[stack]);
         }
         let mut conveyor_count = max_missing.min(self.conveyor.records());
         for r in lending.conveyor_records(conveyor_count) {
@@ -2328,15 +2339,15 @@ impl Scratch {
             }
             for r in pending {
                 inspected.insert(r);
-                if let Some((layer_idx, expert)) = core.directory.host_kept_at(lender, r) {
-                    let lw = core.layers[layer_idx].layer_window;
+                if let Some((stack, expert)) = core.directory.host_kept_at(lender, r) {
+                    let lw = core.layers[core.stack_rep(stack)].layer_window;
                     for sr in lending.scratch_records(expert % lw) {
                         if sr < lent {
                             needed.insert(sr as u32);
                         }
                     }
-                    layer_missing[layer_idx] += 1;
-                    let next_conveyor = layer_missing[layer_idx].min(self.conveyor.records());
+                    stack_missing[stack] += 1;
+                    let next_conveyor = stack_missing[stack].min(self.conveyor.records());
                     if next_conveyor > conveyor_count {
                         conveyor_count = next_conveyor;
                         for cr in lending.conveyor_records(conveyor_count) {
@@ -2411,8 +2422,10 @@ impl Scratch {
             may_evict,
             copy,
         );
-        for (owner, expert) in unmapped {
-            self.demote(owner, expert);
+        for (owner_stack, expert) in unmapped {
+            for &visit in core.visits_of(owner_stack) {
+                self.demote(visit, expert);
+            }
         }
         // Snapshot bank slot reuse in O(lent) under a narrow `transport.registry`
         // guard, then release the guard before exit/unmap/bank-lease work.
@@ -2841,6 +2854,7 @@ impl Scratch {
         //    deadlock-freedom even when `host_slots < opened.cold.len()`.
         let mut need_convey = false;
         let mut batch_ready: Vec<(usize, HostRecord, usize)> = Vec::new();
+        let stack = core.stack(layer);
         let all_posted = {
             let entries = opened.ring_slots.as_mut().expect("ring_slots initialized above");
             for &mut (expert, slot, ref mut posted) in entries.iter_mut() {
@@ -2853,11 +2867,11 @@ impl Scratch {
                 // (newly grown host-tier slots joined during cold prefill have
                 // `from.step() > last`, which would make `hold_for_pass` return
                 // `None` and livelock against `Claim::Kept`).
-                if let Some(record) = core.directory.hold_tier_or_revive(layer, expert) {
+                if let Some(record) = core.directory.hold_tier_or_revive(stack, expert) {
                     *posted = true;
                     batch_ready.push((expert, record, slot));
                     progressed = true;
-                } else if core.directory.located(layer, expert) == crate::experts::host_records::Located::Lacked
+                } else if core.directory.located(stack, expert) == crate::experts::host_records::Located::Lacked
                     && self.conveyor.state(layer, expert).is_none()
                 {
                     // Self-heal: if an expert was evicted before we held it, mark
@@ -2903,7 +2917,7 @@ impl Scratch {
                     core.directory.seed_with(
                         at.point,
                         scratch_group,
-                        layer,
+                        stack,
                         &tier_routed,
                         &read,
                         filled,
@@ -2911,8 +2925,10 @@ impl Scratch {
                         |g, slot| can_reuse(DestSlot { group: g, slot }),
                     )
                 });
-                for (owner, expert) in evicted {
-                    self.demote(owner, expert);
+                for (owner_stack, expert) in evicted {
+                    for &visit in core.visits_of(owner_stack) {
+                        self.demote(visit, expert);
+                    }
                 }
                 self.tiers[index].seeds = Some(seeds);
             }
@@ -2990,7 +3006,7 @@ impl Scratch {
         let held_records: Vec<(usize, HostRecord)> = batch_ready.into_iter().map(|(_, rec, _)| (layer, rec)).collect();
         if items.is_empty() {
             for (l, rec) in held_records {
-                core.directory.unhold_tier(l, rec);
+                core.directory.unhold_tier(core.stack(l), rec);
             }
             if all_posted {
                 self.ring.mark_published(pass_key.generation);
@@ -3023,7 +3039,7 @@ impl Scratch {
                     // handed to `Copies`); if earlier partial batches were
                     // already posted for this generation, quarantine it!
                     for (l, rec) in held_records {
-                        core.directory.unhold_tier(l, rec);
+                        core.directory.unhold_tier(core.stack(l), rec);
                     }
                     opened.ring_slots = None;
                     if self.ring.has_posted_copies(pass_key.generation) {
@@ -3102,12 +3118,13 @@ impl Scratch {
         ledger: &mut crate::experts::interest::Ledger,
         shared: &Shared,
     ) -> bool {
+        let stack = core.stack(layer);
         let landing = |scratch: &Self, core: &Core| {
             cold.iter()
                 .filter(|&&expert| {
-                    copies_from_tier(core) && scratch.conveyor.state(layer, expert).is_none() && core.directory.lands(layer, expert)
+                    copies_from_tier(core) && scratch.conveyor.state(layer, expert).is_none() && core.directory.lands(stack, expert)
                 })
-                .map(|&expert| (layer, expert))
+                .map(|&expert| (stack, expert))
                 .collect::<Vec<_>>()
         };
         let awaited = landing(self, core);
@@ -3175,13 +3192,14 @@ impl Scratch {
         let last = scratch_group.last();
         let mut tiered = Vec::new();
         let mut listed = Vec::new();
+        let stack = core.stack(layer);
         let mut cold = cold
             .into_iter()
             .filter(|&expert| {
                 let copied = copies_from_tier(core)
                     && self.conveyor.state(layer, expert).is_none()
                     && self.conveyor.borrower(expert % lw).is_none();
-                let record = copied.then(|| core.directory.hold_for_pass(layer, expert, last)).flatten();
+                let record = copied.then(|| core.directory.hold_for_pass(stack, expert, last)).flatten();
                 if let Some(record) = record {
                     tiered.push(expert);
                     listed.push((record.0 as i32, scratch(&self.tiers[index], expert) as i32));
@@ -3227,7 +3245,7 @@ impl Scratch {
                     core.directory.seed_with(
                         at.point,
                         scratch_group,
-                        layer,
+                        stack,
                         &tier_routed,
                         &read,
                         filled,
@@ -3235,8 +3253,10 @@ impl Scratch {
                         |g, slot| can_reuse(DestSlot { group: g, slot }),
                     )
                 });
-                for (owner, expert) in evicted {
-                    self.demote(owner, expert);
+                for (owner_stack, expert) in evicted {
+                    for &visit in core.visits_of(owner_stack) {
+                        self.demote(visit, expert);
+                    }
                 }
                 self.tiers[index].seeds = Some(seeds);
             }

@@ -21,10 +21,31 @@ pub struct ImageMarkers {
     start: TokenId,
     row: TokenId,
     end: TokenId,
+    /// When `true`, `end` also closes non-image messages (e.g. Inkling 2's
+    /// `<|end_message|>`), so standalone occurrences outside an image triple
+    /// are treated as ordinary text tokens rather than misaligned media.
+    shared_end: bool,
 }
 
 impl ImageMarkers {
     pub fn new(start: TokenId, row: TokenId, end: TokenId) -> Result<Self, InputPreparationError> {
+        Self::build(start, row, end, false)
+    }
+
+    pub fn new_with_shared_end(
+        start: TokenId,
+        row: TokenId,
+        end: TokenId,
+    ) -> Result<Self, InputPreparationError> {
+        Self::build(start, row, end, true)
+    }
+
+    fn build(
+        start: TokenId,
+        row: TokenId,
+        end: TokenId,
+        shared_end: bool,
+    ) -> Result<Self, InputPreparationError> {
         if [start, row, end]
             .iter()
             .any(|token| token.0 > i32::MAX as u32)
@@ -34,11 +55,16 @@ impl ImageMarkers {
         {
             return Err(InputPreparationError::TokenDomain);
         }
-        Ok(Self { start, row, end })
+        Ok(Self {
+            start,
+            row,
+            end,
+            shared_end,
+        })
     }
 
     fn contains(&self, token: TokenId) -> bool {
-        [self.start, self.row, self.end].contains(&token)
+        token == self.start || token == self.row || (!self.shared_end && token == self.end)
     }
 }
 
@@ -67,7 +93,8 @@ pub fn cell_raster_controls(
     }
     let coordinate =
         |value: usize| i32::try_from(value).map_err(|_| InputPreparationError::VisionGeometry);
-    let mut coordinates = Vec::with_capacity(h * w);
+    let rows = h * w;
+    let mut coordinates = Vec::with_capacity(rows);
     for cell_row in 0..h / merge {
         for cell_col in 0..w / merge {
             for inner_row in 0..merge {
@@ -80,7 +107,7 @@ pub fn cell_raster_controls(
             }
         }
     }
-    VisionSpatialControls::new((0..h * w).collect(), coordinates, None, Vec::new())
+    VisionSpatialControls::new((0..rows).collect(), coordinates, None, Vec::new())
 }
 
 /// Rows at their absolute positions; images expanded between their markers.
@@ -335,5 +362,28 @@ impl ModelInputAdapter for SequentialImageInput {
             source_boundaries,
             vision_inputs,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ImageMarkers;
+    use magnitude_artifacts::TokenId;
+
+    #[test]
+    fn shared_end_marker_is_allowed_outside_image_spans() {
+        let start = TokenId(200005);
+        let row = TokenId(200054);
+        let end = TokenId(200010);
+
+        let exclusive = ImageMarkers::new(start, row, end).unwrap();
+        assert!(exclusive.contains(start));
+        assert!(exclusive.contains(row));
+        assert!(exclusive.contains(end));
+
+        let shared = ImageMarkers::new_with_shared_end(start, row, end).unwrap();
+        assert!(shared.contains(start));
+        assert!(shared.contains(row));
+        assert!(!shared.contains(end));
     }
 }

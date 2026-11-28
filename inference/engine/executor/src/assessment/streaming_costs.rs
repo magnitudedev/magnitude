@@ -2117,7 +2117,7 @@ impl CpuForm {
         // A clamped site's limit as its word; an unclamped site's key is
         // the one it had before sites clamped.
         if self.limit.is_some() {
-            configuration.insert("limit".to_owned(), magnitude_family_contracts::GluLimit::word(self.limit));
+            configuration.insert("limit".to_owned(), crate::operators::glu_limit_word(self.limit));
         }
         for (name, tensor) in self.record.iter() {
             configuration.insert(format!("{name:?}_{}_n", tensor.resident.name()), tensor.matrix[0]);

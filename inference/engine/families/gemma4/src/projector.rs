@@ -221,6 +221,8 @@ fn encoder(reader: &mut Reader, output_hidden: u64) -> Result<Box<VisionDescript
             feedforward_post_norm: Some(rms(
                 reader.tensor(&format!("{p}ffn_post_norm.weight"), &[hidden])?
             )),
+            ls1: None,
+            ls2: None,
         });
     }
     let standardize = if reader.present("v.std_bias") {
@@ -254,6 +256,7 @@ fn encoder(reader: &mut Reader, output_hidden: u64) -> Result<Box<VisionDescript
             positions: Some(table),
             norm: None,
             registers: None,
+            register_positions: None,
         },
         window: None,
         blocks,

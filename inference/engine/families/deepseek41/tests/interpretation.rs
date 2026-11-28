@@ -202,6 +202,8 @@ fn check_attention(
             HistoryRows::Own(RowProducer::Projected(ProjectedRows {
                 key,
                 value,
+                key_conv: None,
+                value_conv: None,
                 key_norm,
                 value_norm,
                 domain,
@@ -259,7 +261,10 @@ fn check_attention(
         assert_eq!(rotation.amplitude, 1.0);
     }
     assert_eq!(attention.scale, (width as f64).powf(-0.5));
-    assert_eq!(attention.sinks.as_ref().unwrap().shape, [heads]);
+    assert!(matches!(
+        &attention.sinks,
+        magnitude_family_contracts::AttentionSinks::Static(sinks) if sinks.shape == [heads]
+    ));
     let OutputProjection::GroupedLowRank {
         groups: g,
         rank: r,

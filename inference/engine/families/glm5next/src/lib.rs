@@ -48,7 +48,8 @@ use magnitude_artifacts::{
 };
 use magnitude_family_common::{Metadata, Tensors, binders};
 use magnitude_family_contracts::{
-    checked_product, ActivationDType, ActivationFunction, Attention, AttentionGate, Block,
+    checked_product, ActivationDType, ActivationFunction, Attention, AttentionGate, AttentionSinks,
+    Block,
     Candidates, DecayGate, Decoder, DenseFfn, EmbeddingScale, EntryForm, ExitForm, ExitNorm,
     ExitSite, FamilyError, FamilyId, FeedForwardUp, GateFunction,
     GateProjection, GatedDelta, GluLimit, Head, HeadBlock, HeadChain, HeadComponent, HeadHistory,
@@ -232,6 +233,7 @@ impl Geometry {
         Ok(Sublayer {
             input: InputNorm::Rms(self.rms(layer.weight(&format!("{norm}.weight"), &[self.hidden])?)),
             op,
+            post_conv: None,
             output: OutputForm::Residual,
         })
     }
@@ -312,6 +314,8 @@ impl Geometry {
         let rows = ProjectedRows {
             key: layer.weight("attn_kv_a_mqa.weight", &[latent, hidden])?,
             value: ValueSource::StoredKey,
+            key_conv: None,
+            value_conv: None,
             key_norm: HeadNorm::Rms(self.rms(layer.weight("attn_kv_a_norm.weight", &[latent])?)),
             value_norm: ValueNorm::None,
             domain: TokenDomain::Token,
@@ -331,10 +335,12 @@ impl Geometry {
                 reads,
             }],
             rotary: Rotary::None,
+            relative_bias: None,
+            log_scale: None,
             // The softmax scale is `qk_nope_head_dim ** -0.5`.
             scale: (self.key_width as f64).powf(-0.5),
             media_rows: MediaRowAttention::Causal,
-            sinks: None,
+            sinks: AttentionSinks::None,
             // Head h's block of `attn_v_b` [heads, value width, latent] is
             // W_UV_h, then the output projection.
             output: OutputProjection::GroupedLowRank {
@@ -578,6 +584,7 @@ pub fn inspect_components(
                     geometry.sited(layer, "attn", "attn_norm", mixer)?,
                     geometry.sited(layer, "ffn", "ffn_norm", feed_forward)?,
                 ],
+                transition: None,
             })
         })
         .collect::<Result<Vec<_>, FamilyError>>()?;
@@ -603,6 +610,7 @@ pub fn inspect_components(
                                 geometry.plain(layer, "attn_norm", mixer)?,
                                 geometry.plain(layer, "ffn_norm", feed_forward)?,
                             ],
+                            transition: None,
                         }],
                         output_norm: ExitNorm::Rms(
                             geometry.rms(layer.weight("nextn.shared_head_norm.weight", &[hidden])?),
@@ -655,6 +663,7 @@ pub fn inspect_components(
                 }),
                 output,
                 softcap: None,
+                unpadded_vocabulary: None,
             },
         },
         head,

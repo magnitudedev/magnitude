@@ -28,7 +28,8 @@ use magnitude_artifacts::{
 };
 use magnitude_family_common::{HeaderError, Metadata, Tensors};
 use magnitude_family_contracts::{
-    ActivationDType, ActivationFunction, Attention, AttentionGate, Block, Decoder, DefinitionError,
+    ActivationDType, ActivationFunction, Attention, AttentionGate, AttentionSinks, Block, Decoder,
+    DefinitionError,
     DenseFfn, EmbeddingScale, EntryForm, ExitForm, ExitNorm, ExpertSelection, FamilyId,
     FeedForwardUp, Head, HeadBlock, HeadChain, HeadComponent, HeadHistory, HeadInput, HeadNorm,
     HeadReadout, HistoryRows, HistorySource, ImportTransform, InputNorm, InputSemantics,
@@ -266,15 +267,20 @@ impl Geometry {
                     value: ValueSource::Projected(
                         binder.bind(&format!("{prefix}attn_v.weight"), &[key_rows, hidden])?,
                     ),
+                    key_conv: None,
+                    value_conv: None,
                     key_norm: HeadNorm::None,
                     value_norm: ValueNorm::None,
                     domain: TokenDomain::Token,
                     rounding: RowRounding::None,
                 },
             )))],
-            rotary: Rotary::None,            scale: 1.0 / (width as f64).sqrt(),
+            rotary: Rotary::None,
+            relative_bias: None,
+            log_scale: None,
+            scale: 1.0 / (width as f64).sqrt(),
             media_rows: MediaRowAttention::Causal,
-            sinks: None,
+            sinks: AttentionSinks::None,
             output: OutputProjection::Full(binder.bind(
                 &format!("{prefix}attn_output.weight"),
                 &[hidden, query_rows],
@@ -463,6 +469,7 @@ impl Geometry {
                 self.rms(binder.bind(&format!("{prefix}attn_norm.weight"), &[self.hidden])?),
             ),
             op,
+            post_conv: None,
             output: OutputForm::Residual,
         })
     }
@@ -611,6 +618,7 @@ pub fn inspect_components(
                     .into_iter()
                     .map(|(layer, kind)| geometry.sublayer(&mut binder, layer, kind))
                     .collect::<Result<_, Error>>()?,
+                transition: None,
             })
         })
         .collect::<Result<Vec<_>, Error>>()?;
@@ -631,6 +639,7 @@ pub fn inspect_components(
             norm: ExitNorm::Rms(geometry.rms(output_norm)),
             output,
             softcap: None,
+            unpadded_vocabulary: None,
         },
     };
     let inputs = InputSemantics { coordinate_axes: 1 };
@@ -711,14 +720,17 @@ fn head_block(
                 Sublayer {
                     input: InputNorm::Rms(attention_norm),
                     op: geometry.attention(binder, &prefix, kv_heads)?,
+                    post_conv: None,
                     output: OutputForm::Residual,
                 },
                 Sublayer {
                     input: InputNorm::Rms(feed_forward_norm),
                     op: geometry.feed_forward(binder, layer, intermediate)?,
+                    post_conv: None,
                     output: OutputForm::Residual,
                 },
             ],
+            transition: None,
         }],
         output_norm,
         readout: HeadReadout::full(VocabularyProjection::Target),

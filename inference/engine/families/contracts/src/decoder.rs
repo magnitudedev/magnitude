@@ -42,6 +42,16 @@ pub enum ResidualForm {
     /// [`OutputForm::Scatter`]; the exit reads them through
     /// [`ExitNorm::HyperConnectionHead`].
     HyperConnections(HyperConnections),
+    /// Depth-wise softmax attention over completed block summaries and the
+    /// running intra-block partial sum (Block Attention Residuals: Kimi,
+    /// Inkling 2). Each source is F32 `[hidden]`; keys are RMS-normalized
+    /// with `norm_epsilon`, and values are RMS-normalized when
+    /// `normalize_values` is true.
+    BlockAttention {
+        block_size: u64,
+        normalize_values: bool,
+        norm_epsilon: f64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -86,6 +96,19 @@ pub enum SinkhornInput {
     OwnSite,
 }
 
+/// Normalization applied to entering rows before the first block.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum EntryNorm {
+    /// Unweighted RMS normalization of every entering row (text and media).
+    Unweighted(UnweightedRms),
+    /// Weighted RMS normalization (`[hidden]`). When `text_only` is true,
+    /// pre-encoded media rows bypass this norm.
+    Rms {
+        norm: RmsNorm,
+        text_only: bool,
+    },
+}
+
 /// How token rows enter the residual stream.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EntryForm {
@@ -93,8 +116,8 @@ pub struct EntryForm {
     pub embedding: WeightDescriptor,
     /// Multiplier applied to text rows (media rows enter unscaled).
     pub scale: EmbeddingScale,
-    /// Unweighted normalization of every entering row.
-    pub norm: Option<UnweightedRms>,
+    /// Optional normalization of entering rows.
+    pub norm: Option<EntryNorm>,
     /// Per-layer inputs gathered once per token (Gemma PLE).
     pub per_layer: Option<PerLayerEntry>,
 }
@@ -142,6 +165,10 @@ pub struct ExitForm {
     pub output: WeightDescriptor,
     /// `cap · tanh(z / cap)` in F32 on the logits.
     pub softcap: Option<f64>,
+    /// True (unpadded) vocabulary size when embedding and output tables are
+    /// padded to `decoder.vocabulary` (e.g., `201024 → 200058`). Logits at
+    /// indices `>= unpadded_vocabulary` are masked/dropped at readout.
+    pub unpadded_vocabulary: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -150,6 +177,12 @@ pub enum ExitNorm {
     Layer(LayerNorm),
     /// Collapses hyper-connection streams before readout.
     HyperConnectionHead(HyperConnectionExit),
+    /// Mixes block-attention residual sources with `query` (`[hidden]`), then
+    /// normalizes with `norm`.
+    BlockAttention {
+        query: WeightDescriptor,
+        norm: RmsNorm,
+    },
 }
 
 /// The decoder's exit over hyper-connection streams: the streams mixed by
@@ -239,18 +272,172 @@ pub struct HyperConnectionInput {
     pub norm: Option<RmsNorm>,
 }
 
+/// State transition performed on the residual stream at the start of a
+/// [`Block`], before its first sublayer runs (looped cores under
+/// [`ResidualForm::BlockAttention`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum BlockTransition {
+    /// Snapshot the current `(blocks, partial)` state as the prelude state
+    /// for subsequent loop passes.
+    SnapshotPrelude,
+    /// Build the cross-pass bank from the core blocks produced since the
+    /// prelude snapshot (`(*blocks[prelude_blocks + 1..], partial)`) and
+    /// reset `(blocks, partial)` back to the snapshotted prelude state.
+    ResetToPreludeAndBank,
+}
+
+/// A low-rank cross-pass message controller over a destination row `dest` and
+/// a cross-pass message `msg` (each `[hidden]`):
+///
+/// ```text
+/// h   = down · [RMS(dest) ‖ RMS(msg)]               ([rank])
+/// out = (1 − tanh(forget · h)) ⊙ dest + tanh(gain · h) ⊙ msg
+/// ```
+///
+/// with unweighted RMS using the decoder's `BlockAttention::norm_epsilon`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MessageController {
+    pub rank: u64,
+    /// `[rank, 2·hidden]`.
+    pub down: WeightDescriptor,
+    /// `[hidden, rank]`.
+    pub gain: WeightDescriptor,
+    /// `[hidden, rank]`.
+    pub forget: WeightDescriptor,
+}
+
+/// One cross-pass read from the previous pass's block bank, mixed into a
+/// destination row by a low-rank [`MessageController`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CrossPassMessage {
+    /// `[hidden]`, F32 query attending the cross-pass bank.
+    pub query: WeightDescriptor,
+    pub controller: MessageController,
+}
+
+/// How a sublayer under [`ResidualForm::BlockAttention`] mixes the current
+/// `(blocks, partial)` sources.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum BlockAttentionQueries {
+    /// Read the running `partial` directly without mixing (e.g., layer 0
+    /// before any block summary exists).
+    Partial,
+    /// Mix `[...blocks, partial]` with one `[hidden]` query into a single row.
+    Single(WeightDescriptor),
+    /// Mix `[...blocks, partial]` with three separate `[hidden]` queries into
+    /// distinct `(x_q, x_k, x_v)` rows (only on [`Operator::Attention`]).
+    SplitQkv {
+        query: WeightDescriptor,
+        key: WeightDescriptor,
+        value: WeightDescriptor,
+    },
+}
+
+/// Cross-pass bank messages injected into a sublayer's mixed input(s) before
+/// its input normalization.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum CrossPassInput {
+    None,
+    /// One cross-pass message mixed into a single destination row.
+    Single(Box<CrossPassMessage>),
+    /// Three cross-pass messages mixed into `(x_q, x_k, x_v)` (splitting a
+    /// single mixed row into three streams when `queries` is `Single` or
+    /// `Partial`; only on [`Operator::Attention`]).
+    SplitQkv {
+        query: Box<CrossPassMessage>,
+        key: Box<CrossPassMessage>,
+        value: Box<CrossPassMessage>,
+    },
+}
+
+/// Input RMS normalization(s) applied after block-attention residual mixing
+/// (and optional cross-pass injection).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum BlockAttentionNorm {
+    /// One shared `[hidden]` RMSNorm applied to the single stream (or to each
+    /// of `(x_q, x_k, x_v)` on local looped layers).
+    Shared(RmsNorm),
+    /// Three separate `[hidden]` RMSNorms applied to `(x_q, x_k, x_v)` on
+    /// global attention layers (only valid on [`Operator::Attention`]).
+    SplitQkv {
+        query: RmsNorm,
+        key: RmsNorm,
+        value: RmsNorm,
+    },
+}
+
+impl BlockAttentionNorm {
+    pub fn epsilon(&self) -> f64 {
+        match self {
+            Self::Shared(norm) => norm.epsilon,
+            Self::SplitQkv { query, .. } => query.epsilon,
+        }
+    }
+}
+
+/// A sublayer's input under [`ResidualForm::BlockAttention`]: mix sources via
+/// `queries`, optionally inject `cross_pass` messages, then apply `norm` to
+/// the resulting row(s).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BlockAttentionInput {
+    pub queries: BlockAttentionQueries,
+    pub cross_pass: CrossPassInput,
+    pub norm: BlockAttentionNorm,
+}
+
+/// Input-dependent per-head dynamic taps for a [`CausalShortConv`]:
+/// `taps = proj · x_in` (`[heads, kernel_size]`), broadcast across each head's
+/// channels (`channels / heads`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DynamicConvTap {
+    /// `[heads·kernel_size, input_width]`.
+    pub proj: WeightDescriptor,
+    pub heads: u64,
+}
+
+/// Depthwise causal short convolution with residual connection and variance
+/// normalization:
+///
+/// ```text
+/// y = residual_scale · (x + conv_static(x) + conv_dyn(x, x_in))
+/// ```
+///
+/// Usable on projected keys/values (`ProjectedRows`) and on sublayer outputs
+/// (`Sublayer::post_conv`, e.g., post-attention and post-FFN).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CausalShortConv {
+    /// Number of taps `K >= 2` (the current frame included; state holds `K - 1`
+    /// past frames).
+    pub kernel_size: u64,
+    /// Static depthwise taps `[channels, kernel_size]`.
+    pub weight: WeightDescriptor,
+    /// Optional input-dependent per-head dynamic taps.
+    pub dynamic: Option<DynamicConvTap>,
+    /// Output variance-normalization factor (e.g., `1 / sqrt(K + 1)` static,
+    /// `1 / sqrt(2·K + 1)` dynamic).
+    pub residual_scale: f64,
+}
+
 /// One decoder layer: usually `[mixer, feed-forward]`, possibly a lone mixer
 /// or with further sublayers (Gemma per-layer input).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Block {
     pub sublayers: Vec<Sublayer>,
+    /// Optional residual-state transition at the start of this block, before
+    /// its first sublayer runs.
+    #[serde(default)]
+    pub transition: Option<BlockTransition>,
 }
 
-/// `residual ← output(residual, op(input(residual)))`.
+/// `residual ← output(residual, post_conv(op(input(residual))))`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Sublayer {
     pub input: InputNorm,
     pub op: Operator,
+    /// Optional causal short convolution applied to the operator's output
+    /// before joining the residual stream.
+    #[serde(default)]
+    pub post_conv: Option<CausalShortConv>,
     pub output: OutputForm,
 }
 
@@ -267,6 +454,9 @@ pub enum InputNorm {
     RmsUnweighted(UnweightedRms),
     /// Mixes hyper-connection streams into the sublayer input.
     HyperConnectionMix(HyperConnectionInput),
+    /// Mixes block-attention residual sources (and optional cross-pass bank
+    /// messages) into the sublayer input(s), then applies RMSNorm.
+    BlockAttention(BlockAttentionInput),
     /// The operator reads the raw residual: every stream, under
     /// hyper-connections.
     None,
@@ -277,6 +467,7 @@ impl InputNorm {
         match self {
             Self::Rms(norm) => Some(norm.epsilon),
             Self::RmsUnweighted(norm) => Some(norm.epsilon),
+            Self::BlockAttention(input) => Some(input.norm.epsilon()),
             Self::HyperConnectionMix(_) | Self::None => None,
         }
     }
@@ -284,8 +475,12 @@ impl InputNorm {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum OutputForm {
-    /// `residual + y`; under hyper-connections `y` has a row per stream.
+    /// `residual + y`; under hyper-connections `y` has a row per stream;
+    /// under block-attention residuals `partial ← partial + y`.
     Residual,
+    /// Under [`ResidualForm::BlockAttention`]: push the current `partial` to
+    /// `blocks` as a completed block summary and start a new `partial ← y`.
+    BlockCommit,
     /// `Σ_s B[s, d]·X[s] + C[d]·y` for every hyper-connection stream `d`,
     /// with `B` and `C` the output coefficients of the sublayer's own mix
     /// site ([`HyperConnectionMixing`]).
@@ -351,6 +546,51 @@ pub enum BranchOutput {
 
 // --- attention ---------------------------------------------------------------
 
+/// Learned relative-position attention bias (NoPE relative bias):
+///
+/// ```text
+/// r     = rel_clip(query_proj · x_q)               ([heads, d_rel])
+/// table = r · bias_projᵀ                           ([heads, extent])
+/// ```
+///
+/// Query head `h` at position `pos_q` adds `table[h, d]` to the attention
+/// logit of key at `pos_k` for distance `d = pos_q − pos_k < extent` (and `0`
+/// for `d ≥ extent`). When [`LogScale`] is present, `r` is scaled by
+/// `τ(pos_q)` before `bias_proj`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RelativeBias {
+    pub d_rel: u64,
+    pub extent: u64,
+    /// `[heads·d_rel, hidden]`.
+    pub query_proj: WeightDescriptor,
+    /// Per-head normalization or L2 clipping over `d_rel`.
+    pub rel_clip: HeadNorm,
+    /// `[extent, d_rel]`.
+    pub bias_proj: WeightDescriptor,
+}
+
+/// Position-dependent logarithmic attention scaling applied to queries (and
+/// relative-bias queries when present):
+/// `τ(pos) = 1 + alpha · ln(max(1, (pos + 1) / floor))`.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LogScale {
+    pub floor: u64,
+    pub alpha: f64,
+}
+
+/// Per-head attention sink logits: query head `h`'s softmax gains one sink
+/// logit `s[h]` (compared with the scaled scores) whose value is zero, so its
+/// output is `Σ e^{s_k}·v_k / (e^{s[h]} + Σ e^{s_k}) = σ(LSE − s[h]) · softmax(s)·v`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum AttentionSinks {
+    None,
+    /// Static per-head sink logits `[heads]`.
+    Static(WeightDescriptor),
+    /// Per-token per-head sink logits `weight · x_q`, `[heads, hidden]`,
+    /// folded via post-attention LSE.
+    Dynamic(WeightDescriptor),
+}
+
 /// Softmax attention over history spans. `W` is the head width of the
 /// queries the softmax reads, of keys and of values alike; with absorbed
 /// query keys ([`QueryKeys::Absorbed`]) the query projection's heads have
@@ -371,14 +611,19 @@ pub struct Attention {
     /// then the selected rows of each later source in source order.
     pub history: Vec<HistorySource>,
     pub rotary: Rotary,
+    /// Optional learned relative-position bias table (NoPE relative bias).
+    #[serde(default)]
+    pub relative_bias: Option<RelativeBias>,
+    /// Optional position-dependent logarithmic scaling on queries (and
+    /// relative-bias queries).
+    #[serde(default)]
+    pub log_scale: Option<LogScale>,
     /// Multiplier on `q·k` before the softmax, the same for every source.
     pub scale: f64,
     /// Whether media rows of one span see each other.
     pub media_rows: MediaRowAttention,
-    /// Per-head attention sinks `[heads]`: query head `h`'s softmax gains
-    /// one logit `sinks[h]` (compared with the scaled scores) whose value is
-    /// zero, so its output is `Σ e^{s_k}·v_k / (e^{sinks[h]} + Σ e^{s_k})`.
-    pub sinks: Option<WeightDescriptor>,
+    /// Per-head attention sinks (none, static, or per-token dynamic).
+    pub sinks: AttentionSinks,
     pub output: OutputProjection,
 }
 
@@ -502,6 +747,14 @@ pub enum HeadNorm {
     /// No normalization (unit RMS is not the identity).
     None,
     Rms(RmsNorm),
+    /// Optional per-head per-channel `scale` (`[heads, width]`), followed by
+    /// per-head L2 norm clipping:
+    /// `x' = x · min(1, threshold / (||x||_2 + epsilon))`.
+    L2Clip {
+        threshold: f64,
+        epsilon: f64,
+        scale: Option<WeightDescriptor>,
+    },
 }
 
 /// Unweighted per-head normalization of values before they are stored.
@@ -568,13 +821,22 @@ impl Attention {
     }
 }
 
-/// Per-token keys and values: key `rotary(key_norm(key·x))`, then
-/// `rounding`; the value by `value`.
+/// Per-token keys and values: key `rotary(key_norm(key_conv(key·x)))`, then
+/// `rounding`; the value by `value` (optionally through `value_conv` and
+/// `value_norm`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProjectedRows {
     /// `[kv_heads·W, hidden]`.
     pub key: WeightDescriptor,
     pub value: ValueSource,
+    /// Optional causal short convolution applied to projected keys before
+    /// `key_norm`.
+    #[serde(default)]
+    pub key_conv: Option<CausalShortConv>,
+    /// Optional causal short convolution applied to projected values before
+    /// `value_norm`.
+    #[serde(default)]
+    pub value_conv: Option<CausalShortConv>,
     pub key_norm: HeadNorm,
     pub value_norm: ValueNorm,
     pub domain: TokenDomain,
@@ -1142,15 +1404,14 @@ pub enum ActivationFunction {
     ReluSquared,
 }
 
-/// A gated expansion's clamp L (DeepSeek V4.1's `swiglu_limit`): positive
-/// and finite at F32, the width the kernels clamp at, by construction; a
-/// definition carrying any other value does not deserialize. Equal by bits,
-/// which is equality for these values.
+/// A positive, finite-at-F32 bound scalar for gated feed-forward expansions,
+/// by construction; a definition carrying any other value does not
+/// deserialize. Equal by bits, which is equality for these values.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(try_from = "f64", into = "f64")]
-pub struct GluLimit(f64);
+pub struct GluCap(f64);
 
-impl GluLimit {
+impl GluCap {
     pub fn new(limit: f64) -> Result<Self, DefinitionError> {
         let word = limit as f32;
         if word > 0.0 && word.is_finite() {
@@ -1160,16 +1421,12 @@ impl GluLimit {
         }
     }
 
-    /// The static `LB` of the kernels' gated expansions (functions.seismic's
-    /// `glu`) for an expansion's clamp: the bits of L at F32, or 0, which no
-    /// limit takes, for none. A kernel compiles the clamp in only where it is
-    /// nonzero.
-    pub fn word(limit: Option<Self>) -> u64 {
-        limit.map_or(0, |limit| u64::from((limit.0 as f32).to_bits()))
+    pub fn bits_f32(self) -> u64 {
+        u64::from((self.0 as f32).to_bits())
     }
 }
 
-impl TryFrom<f64> for GluLimit {
+impl TryFrom<f64> for GluCap {
     type Error = DefinitionError;
 
     fn try_from(limit: f64) -> Result<Self, DefinitionError> {
@@ -1177,23 +1434,72 @@ impl TryFrom<f64> for GluLimit {
     }
 }
 
-impl From<GluLimit> for f64 {
-    fn from(limit: GluLimit) -> f64 {
+impl From<GluCap> for f64 {
+    fn from(limit: GluCap) -> f64 {
         limit.0
     }
 }
 
-impl PartialEq for GluLimit {
+impl PartialEq for GluCap {
     fn eq(&self, other: &Self) -> bool {
         self.0.to_bits() == other.0.to_bits()
     }
 }
 
-impl Eq for GluLimit {}
+impl Eq for GluCap {}
 
-impl std::hash::Hash for GluLimit {
+impl std::hash::Hash for GluCap {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.0.to_bits().hash(state);
+    }
+}
+
+/// A bound on a gated feed-forward expansion's gate and up projections:
+/// positive and finite at F32 by construction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum GluLimit {
+    /// Hard clamp `L` (DeepSeek V4.1's `swiglu_limit`):
+    /// `act(min(g, L)) ⊙ clamp(u, -L, L)` (gate above only, up on both sides).
+    Clamp(GluCap),
+    /// Smooth tanh softcap (Inkling 2's SITU, with `ActivationFunction::Silu`):
+    /// `(gate_cap · tanh(g / gate_cap)) · σ(g) · (up_cap · tanh(u / up_cap))`,
+    /// where `σ(g)` is evaluated on the uncapped gate `g`.
+    Softcap {
+        gate_cap: GluCap,
+        up_cap: GluCap,
+    },
+}
+
+impl GluLimit {
+    /// Construct a hard clamp [`Self::Clamp`].
+    pub fn new(limit: f64) -> Result<Self, DefinitionError> {
+        Ok(Self::Clamp(GluCap::new(limit)?))
+    }
+
+    /// Construct a smooth tanh softcap [`Self::Softcap`] (SITU).
+    pub fn softcap(gate_cap: f64, up_cap: f64) -> Result<Self, DefinitionError> {
+        Ok(Self::Softcap {
+            gate_cap: GluCap::new(gate_cap)?,
+            up_cap: GluCap::new(up_cap)?,
+        })
+    }
+
+    /// The static `LB` of the kernels' clamped gated expansions
+    /// (`functions.seismic`'s `glu`): the bits of `L` at F32 for
+    /// [`Self::Clamp`], or `0` for none or [`Self::Softcap`].
+    pub fn word(limit: Option<Self>) -> u64 {
+        match limit {
+            Some(Self::Clamp(cap)) => cap.bits_f32(),
+            None | Some(Self::Softcap { .. }) => 0,
+        }
+    }
+
+    /// The `(gate_cap, up_cap)` F32 bit words for [`Self::Softcap`], or `None`.
+    pub fn softcap_words(limit: Option<Self>) -> Option<(u64, u64)> {
+        match limit {
+            Some(Self::Softcap { gate_cap, up_cap }) => Some((gate_cap.bits_f32(), up_cap.bits_f32())),
+            None | Some(Self::Clamp(_)) => None,
+        }
     }
 }
 
@@ -1201,9 +1507,8 @@ impl std::hash::Hash for GluLimit {
 /// split into `gate` and `up` by import row ranges.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum FeedForwardUp {
-    /// `act(gate·x) ⊙ (up·x)`, or with a `limit` L,
-    /// `act(min(gate·x, L)) ⊙ clamp(up·x, -L, L)` (DeepSeek V4.1's
-    /// `swiglu_limit`: the gate above only, up on both sides).
+    /// `act(gate·x) ⊙ (up·x)`, optionally bounded by [`GluLimit`] (hard
+    /// clamp or SITU tanh softcap).
     Gated {
         activation: ActivationFunction,
         limit: Option<GluLimit>,
@@ -1585,6 +1890,11 @@ impl Decoder {
         source_producer(&self.blocks, index, part)
     }
 
+    /// The active (unpadded) vocabulary size for logit readout and sampling.
+    pub fn active_vocabulary(&self) -> u64 {
+        self.exit.unpadded_vocabulary.unwrap_or(self.vocabulary)
+    }
+
     pub fn validate(&self, coordinate_axes: u8) -> Result<(), DefinitionError> {
         if [self.hidden, self.vocabulary, self.context_limit].contains(&0) {
             return Err(DefinitionError::new("invalid decoder dimensions"));
@@ -1592,22 +1902,36 @@ impl Decoder {
         if self.blocks.is_empty() {
             return Err(DefinitionError::new("decoder has no blocks"));
         }
-        if let ResidualForm::HyperConnections(form) = &self.residual {
-            let invalid = match form.mixing {
-                HyperConnectionMixing::LowRankGated { rank } => rank == 0,
-                HyperConnectionMixing::Sinkhorn {
-                    iterations,
-                    epsilon,
-                    norm_epsilon,
-                    ..
-                } => {
-                    iterations == 0
-                        || positive_epsilon(epsilon).is_err()
-                        || positive_epsilon(norm_epsilon).is_err()
+        match &self.residual {
+            ResidualForm::Single => {}
+            ResidualForm::HyperConnections(form) => {
+                let invalid = match form.mixing {
+                    HyperConnectionMixing::LowRankGated { rank } => rank == 0,
+                    HyperConnectionMixing::Sinkhorn {
+                        iterations,
+                        epsilon,
+                        norm_epsilon,
+                        ..
+                    } => {
+                        iterations == 0
+                            || positive_epsilon(epsilon).is_err()
+                            || positive_epsilon(norm_epsilon).is_err()
+                    }
+                };
+                if form.streams < 2 || invalid {
+                    return Err(DefinitionError::new("invalid hyper-connection geometry"));
                 }
-            };
-            if form.streams < 2 || invalid {
-                return Err(DefinitionError::new("invalid hyper-connection geometry"));
+            }
+            ResidualForm::BlockAttention {
+                block_size,
+                norm_epsilon,
+                ..
+            } => {
+                if *block_size == 0 || positive_epsilon(*norm_epsilon).is_err() {
+                    return Err(DefinitionError::new(
+                        "invalid block-attention residual geometry",
+                    ));
+                }
             }
         }
         self.validate_entry()?;
@@ -1633,6 +1957,11 @@ impl Decoder {
         {
             return Err(DefinitionError::new("invalid logit softcap"));
         }
+        if let Some(unpadded) = self.exit.unpadded_vocabulary {
+            if unpadded == 0 || unpadded > self.vocabulary {
+                return Err(DefinitionError::new("invalid unpadded vocabulary size"));
+            }
+        }
         Ok(())
     }
 
@@ -1643,8 +1972,10 @@ impl Decoder {
             &[self.vocabulary, self.hidden],
             "token embedding",
         )?;
-        if let Some(norm) = &entry.norm {
-            positive_epsilon(norm.epsilon)?;
+        match &entry.norm {
+            None => {}
+            Some(EntryNorm::Unweighted(norm)) => positive_epsilon(norm.epsilon)?,
+            Some(EntryNorm::Rms { norm, .. }) => validate_rms(norm, self.hidden, "entry norm")?,
         }
         if let Some(per_layer) = &entry.per_layer {
             let rows = checked_product(&[per_layer.layers, per_layer.width])?;
@@ -1814,37 +2145,77 @@ pub(crate) fn source_producer(
 }
 
 pub(crate) fn validate_blocks(blocks: &[Block], context: &Context) -> Result<(), DefinitionError> {
-    for block in blocks {
+    let mut prelude_snapshotted = false;
+    let mut bank_ready = false;
+    for (block_idx, block) in blocks.iter().enumerate() {
         if block.sublayers.is_empty() {
             return Err(DefinitionError::new("block has no sublayers"));
         }
-    }
-    for (index, sublayer) in indexed_sublayers(blocks) {
-        validate_residual_use(sublayer, context.residual)?;
-        validate_input(&sublayer.input, context, "sublayer input norm")?;
-        validate_operator(&sublayer.op, context)?;
-        match &sublayer.output {
-            OutputForm::Residual | OutputForm::Scatter => {}
-            OutputForm::PostNorm(norm) => validate_rms(norm, context.hidden, "sublayer post norm")?,
-            OutputForm::ScaledPostNorm { norm, layer_scale } => {
-                validate_rms(norm, context.hidden, "sublayer post norm")?;
-                expect_shape(layer_scale, &[1], "sublayer layer scale")?;
+        match block.transition {
+            None => {}
+            Some(BlockTransition::SnapshotPrelude) => {
+                if !matches!(context.residual, ResidualForm::BlockAttention { .. }) {
+                    return Err(DefinitionError::new(
+                        "block transition requires block-attention residuals",
+                    ));
+                }
+                prelude_snapshotted = true;
+            }
+            Some(BlockTransition::ResetToPreludeAndBank) => {
+                if !matches!(context.residual, ResidualForm::BlockAttention { .. }) {
+                    return Err(DefinitionError::new(
+                        "block transition requires block-attention residuals",
+                    ));
+                }
+                if !prelude_snapshotted {
+                    return Err(DefinitionError::new(
+                        "reset-to-prelude transition without an earlier prelude snapshot",
+                    ));
+                }
+                bank_ready = true;
             }
         }
-        match &sublayer.op {
-            Operator::Attention(attention) => {
-                validate_shared_sources(blocks, index, attention, context)?;
-                validate_output_rotary(blocks, attention, context)?;
+        for (sublayer_idx, sublayer) in block.sublayers.iter().enumerate() {
+            let index = SublayerIndex {
+                block: block_idx as u32,
+                sublayer: sublayer_idx as u32,
+            };
+            validate_residual_use(sublayer, context.residual, bank_ready)?;
+            validate_input(&sublayer.input, context, "sublayer input norm")?;
+            validate_operator(&sublayer.op, context)?;
+            if let Some(conv) = &sublayer.post_conv {
+                validate_causal_short_conv(
+                    conv,
+                    context.hidden,
+                    context.hidden,
+                    "sublayer post short convolution",
+                )?;
             }
-            Operator::Parallel(branches) => {
-                for branch in branches {
-                    if let Operator::Attention(attention) = &branch.op {
-                        validate_shared_sources(blocks, index, attention, context)?;
-                        validate_output_rotary(blocks, attention, context)?;
-                    }
+            match &sublayer.output {
+                OutputForm::Residual | OutputForm::BlockCommit | OutputForm::Scatter => {}
+                OutputForm::PostNorm(norm) => {
+                    validate_rms(norm, context.hidden, "sublayer post norm")?
+                }
+                OutputForm::ScaledPostNorm { norm, layer_scale } => {
+                    validate_rms(norm, context.hidden, "sublayer post norm")?;
+                    expect_shape(layer_scale, &[1], "sublayer layer scale")?;
                 }
             }
-            _ => {}
+            match &sublayer.op {
+                Operator::Attention(attention) => {
+                    validate_shared_sources(blocks, index, attention, context)?;
+                    validate_output_rotary(blocks, attention, context)?;
+                }
+                Operator::Parallel(branches) => {
+                    for branch in branches {
+                        if let Operator::Attention(attention) = &branch.op {
+                            validate_shared_sources(blocks, index, attention, context)?;
+                            validate_output_rotary(blocks, attention, context)?;
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
     }
     Ok(())
@@ -2050,10 +2421,13 @@ fn validate_shared_indexer(
 }
 
 /// Under hyper-connections a sublayer either mixes and scatters, or is an
-/// n-gram input over the raw streams; a single residual uses neither.
+/// n-gram input over the raw streams; under block-attention residuals a
+/// sublayer reads through `InputNorm::BlockAttention` and writes through
+/// `Residual` or `BlockCommit`; a single residual uses none of those.
 fn validate_residual_use(
     sublayer: &Sublayer,
     residual: &ResidualForm,
+    bank_ready: bool,
 ) -> Result<(), DefinitionError> {
     // A sublayer's site joins its output into the streams: a low-rank site
     // with inject weights, or any Sinkhorn site.
@@ -2068,10 +2442,18 @@ fn validate_residual_use(
         })
     );
     let scatters = matches!(sublayer.output, OutputForm::Scatter);
+    let commits = matches!(sublayer.output, OutputForm::BlockCommit);
     let ngram = matches!(sublayer.op, Operator::NGramInput(_));
+    let attention = matches!(sublayer.op, Operator::Attention(_));
     let valid = match residual {
         ResidualForm::Single => {
-            !ngram && !scatters && !matches!(sublayer.input, InputNorm::HyperConnectionMix(_))
+            !ngram
+                && !scatters
+                && !commits
+                && !matches!(
+                    sublayer.input,
+                    InputNorm::HyperConnectionMix(_) | InputNorm::BlockAttention(_)
+                )
         }
         ResidualForm::HyperConnections(_) if ngram => {
             matches!(sublayer.input, InputNorm::None)
@@ -2079,6 +2461,38 @@ fn validate_residual_use(
         }
         ResidualForm::HyperConnections(_) => {
             mixes && scatters && !matches!(sublayer.op, Operator::Parallel(_))
+        }
+        ResidualForm::BlockAttention { .. } => {
+            let InputNorm::BlockAttention(ba) = &sublayer.input else {
+                return Err(DefinitionError::new(format!(
+                    "{} sublayer disagrees with the residual form",
+                    sublayer.op.name()
+                )));
+            };
+            let split_queries = matches!(ba.queries, BlockAttentionQueries::SplitQkv { .. });
+            let split_cross = matches!(ba.cross_pass, CrossPassInput::SplitQkv { .. });
+            let split_norm = matches!(ba.norm, BlockAttentionNorm::SplitQkv { .. });
+            let uses_cross = !matches!(ba.cross_pass, CrossPassInput::None);
+            let single_cross_on_split =
+                split_queries && matches!(ba.cross_pass, CrossPassInput::Single(_));
+            if uses_cross && !bank_ready {
+                return Err(DefinitionError::new(
+                    "cross-pass message input without an earlier reset-to-prelude bank transition",
+                ));
+            }
+            if (split_queries || split_cross || split_norm) && !attention {
+                return Err(DefinitionError::new(
+                    "split Q/K/V block-attention inputs require an attention operator",
+                ));
+            }
+            if single_cross_on_split {
+                return Err(DefinitionError::new(
+                    "a single cross-pass message cannot feed split Q/K/V queries",
+                ));
+            }
+            !ngram
+                && !matches!(sublayer.op, Operator::Parallel(_))
+                && matches!(sublayer.output, OutputForm::Residual | OutputForm::BlockCommit)
         }
     };
     if !valid {
@@ -2098,8 +2512,98 @@ fn validate_input(input: &InputNorm, context: &Context, role: &str) -> Result<()
             validate_hyper_connection(&input.site, context, role)?;
             validate_mixed_norm(input.norm.as_ref(), context, role)
         }
+        InputNorm::BlockAttention(input) => validate_block_attention_input(input, context, role),
         InputNorm::None => Ok(()),
     }
+}
+
+fn validate_block_attention_input(
+    input: &BlockAttentionInput,
+    context: &Context,
+    role: &str,
+) -> Result<(), DefinitionError> {
+    let hidden = context.hidden;
+    match &input.queries {
+        BlockAttentionQueries::Partial => {}
+        BlockAttentionQueries::Single(query) => {
+            expect_shape(query, &[hidden], "block-attention query")?;
+        }
+        BlockAttentionQueries::SplitQkv { query, key, value } => {
+            expect_shape(query, &[hidden], "block-attention query")?;
+            expect_shape(key, &[hidden], "block-attention key query")?;
+            expect_shape(value, &[hidden], "block-attention value query")?;
+        }
+    }
+    match &input.cross_pass {
+        CrossPassInput::None => {}
+        CrossPassInput::Single(message) => validate_cross_pass_message(message, hidden)?,
+        CrossPassInput::SplitQkv { query, key, value } => {
+            validate_cross_pass_message(query, hidden)?;
+            validate_cross_pass_message(key, hidden)?;
+            validate_cross_pass_message(value, hidden)?;
+        }
+    }
+    match &input.norm {
+        BlockAttentionNorm::Shared(norm) => validate_rms(norm, hidden, role),
+        BlockAttentionNorm::SplitQkv { query, key, value } => {
+            validate_rms(query, hidden, "block-attention query input norm")?;
+            validate_rms(key, hidden, "block-attention key input norm")?;
+            validate_rms(value, hidden, "block-attention value input norm")
+        }
+    }
+}
+
+fn validate_cross_pass_message(
+    message: &CrossPassMessage,
+    hidden: u64,
+) -> Result<(), DefinitionError> {
+    expect_shape(&message.query, &[hidden], "cross-pass query")?;
+    let controller = &message.controller;
+    if controller.rank == 0 {
+        return Err(DefinitionError::new("message controller has no rank"));
+    }
+    let two_hidden = checked_product(&[2, hidden])?;
+    expect_shape(
+        &controller.down,
+        &[controller.rank, two_hidden],
+        "message controller down projection",
+    )?;
+    expect_shape(
+        &controller.gain,
+        &[hidden, controller.rank],
+        "message controller gain projection",
+    )?;
+    expect_shape(
+        &controller.forget,
+        &[hidden, controller.rank],
+        "message controller forget projection",
+    )
+}
+
+fn validate_causal_short_conv(
+    conv: &CausalShortConv,
+    channels: u64,
+    input_width: u64,
+    role: &str,
+) -> Result<(), DefinitionError> {
+    if conv.kernel_size < 2 || !conv.residual_scale.is_finite() || conv.residual_scale <= 0.0 {
+        return Err(DefinitionError::new(format!("invalid {role} geometry")));
+    }
+    expect_shape(&conv.weight, &[channels, conv.kernel_size], role)?;
+    if let Some(dynamic) = &conv.dynamic {
+        if dynamic.heads == 0 || !channels.is_multiple_of(dynamic.heads) {
+            return Err(DefinitionError::new(format!(
+                "invalid {role} dynamic tap head count"
+            )));
+        }
+        let rows = checked_product(&[dynamic.heads, conv.kernel_size])?;
+        expect_shape(
+            &dynamic.proj,
+            &[rows, input_width],
+            &format!("{role} dynamic tap projection"),
+        )?;
+    }
+    Ok(())
 }
 
 /// The low-rank site's stream count and rank.
@@ -2317,7 +2821,12 @@ fn validate_attention(attention: &Attention, context: &Context) -> Result<(), De
         };
         expect_shape(weight, &[rows, hidden], "attention gate")?;
     }
-    validate_head_norm(&attention.query_norm, width, "attention query norm")?;
+    validate_head_norm(
+        &attention.query_norm,
+        attention.heads,
+        width,
+        "attention query norm",
+    )?;
     if attention.history.is_empty() {
         return Err(DefinitionError::new("attention reads no history"));
     }
@@ -2409,8 +2918,41 @@ fn validate_attention(attention: &Attention, context: &Context) -> Result<(), De
             }
         }
     }
-    if let Some(sinks) = &attention.sinks {
-        expect_shape(sinks, &[attention.heads], "attention sinks")?;
+    if let Some(rel) = &attention.relative_bias {
+        if rel.d_rel == 0 || rel.extent == 0 {
+            return Err(DefinitionError::new("invalid relative bias geometry"));
+        }
+        let rel_rows = checked_product(&[attention.heads, rel.d_rel])?;
+        expect_shape(
+            &rel.query_proj,
+            &[rel_rows, hidden],
+            "attention relative query",
+        )?;
+        validate_head_norm(
+            &rel.rel_clip,
+            attention.heads,
+            rel.d_rel,
+            "attention relative query norm",
+        )?;
+        expect_shape(
+            &rel.bias_proj,
+            &[rel.extent, rel.d_rel],
+            "attention relative bias projection",
+        )?;
+    }
+    if let Some(log_scale) = &attention.log_scale {
+        if log_scale.floor == 0 || !log_scale.alpha.is_finite() || log_scale.alpha <= 0.0 {
+            return Err(DefinitionError::new("invalid attention log scale"));
+        }
+    }
+    match &attention.sinks {
+        AttentionSinks::None => {}
+        AttentionSinks::Static(sinks) => {
+            expect_shape(sinks, &[attention.heads], "attention sinks")?;
+        }
+        AttentionSinks::Dynamic(sinks) => {
+            expect_shape(sinks, &[attention.heads, hidden], "attention dynamic sinks")?;
+        }
     }
     match &attention.output {
         OutputProjection::Full(output) => {
@@ -2471,9 +3013,25 @@ fn validate_projected(
             if !matches!(rows.value_norm, ValueNorm::None) {
                 return Err(DefinitionError::new("stored-key values with a value norm"));
             }
+            if rows.value_conv.is_some() {
+                return Err(DefinitionError::new(
+                    "stored-key values with a value short convolution",
+                ));
+            }
         }
     }
-    validate_head_norm(&rows.key_norm, width, "attention key norm")?;
+    if let Some(conv) = &rows.key_conv {
+        validate_causal_short_conv(conv, kv_rows, hidden, "attention key short convolution")?;
+    }
+    if let Some(conv) = &rows.value_conv {
+        validate_causal_short_conv(conv, kv_rows, hidden, "attention value short convolution")?;
+    }
+    validate_head_norm(
+        &rows.key_norm,
+        attention.kv_heads,
+        width,
+        "attention key norm",
+    )?;
     if let ValueNorm::RmsUnweighted(norm) = rows.value_norm {
         positive_epsilon(norm.epsilon)?;
     }
@@ -2590,7 +3148,12 @@ fn validate_indexer(
         &[checked_product(&[indexer.heads, indexer.width])?, input],
         "indexer query",
     )?;
-    validate_head_norm(&indexer.query.norm, indexer.width, "indexer query norm")?;
+    validate_head_norm(
+        &indexer.query.norm,
+        indexer.heads,
+        indexer.width,
+        "indexer query norm",
+    )?;
     validate_rounding(indexer.query.rounding, indexer.width, "indexer query rounding")?;
     if let HeadWeights::Projected(weight) = &indexer.head_weights {
         expect_shape(weight, &[indexer.heads, hidden], "indexer head weights")?;
@@ -2876,16 +3439,48 @@ fn validate_routed(routed: &RoutedFfn, hidden: u64) -> Result<(), DefinitionErro
 }
 
 fn validate_up(up: &FeedForwardUp, shape: &[u64], role: &str) -> Result<(), DefinitionError> {
+    if let FeedForwardUp::Gated {
+        activation,
+        limit: Some(GluLimit::Softcap { .. }),
+        ..
+    } = up
+    {
+        if *activation != ActivationFunction::Silu {
+            return Err(DefinitionError::new(
+                "softcapped gated expansion requires SiLU activation",
+            ));
+        }
+    }
     if let Some(gate) = up.gate() {
         expect_shape(gate, shape, &format!("{role} gate projection"))?;
     }
     expect_shape(up.up(), shape, &format!("{role} up projection"))
 }
 
-fn validate_head_norm(norm: &HeadNorm, width: u64, role: &str) -> Result<(), DefinitionError> {
+pub(crate) fn validate_head_norm(
+    norm: &HeadNorm,
+    heads: u64,
+    width: u64,
+    role: &str,
+) -> Result<(), DefinitionError> {
     match norm {
         HeadNorm::None => Ok(()),
         HeadNorm::Rms(norm) => validate_rms(norm, width, role),
+        HeadNorm::L2Clip {
+            threshold,
+            epsilon,
+            scale,
+        } => {
+            let t = *threshold as f32;
+            if !threshold.is_finite() || *threshold <= 0.0 || !t.is_finite() || t <= 0.0 {
+                return Err(DefinitionError::new("invalid L2 clip threshold"));
+            }
+            positive_epsilon(*epsilon)?;
+            if let Some(scale) = scale {
+                expect_shape(scale, &[heads, width], role)?;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -2899,14 +3494,13 @@ pub(crate) fn validate_exit_norm(
     context: &Context,
     role: &str,
 ) -> Result<(), DefinitionError> {
-    let hyper_connections = matches!(context.residual, ResidualForm::HyperConnections(_));
-    match norm {
-        ExitNorm::Rms(norm) if !hyper_connections => validate_rms(norm, context.hidden, role),
-        ExitNorm::Layer(norm) if !hyper_connections => {
+    match (norm, context.residual) {
+        (ExitNorm::Rms(norm), ResidualForm::Single) => validate_rms(norm, context.hidden, role),
+        (ExitNorm::Layer(norm), ResidualForm::Single) => {
             expect_shape(&norm.weight, &[context.hidden], role)?;
             positive_epsilon(norm.epsilon)
         }
-        ExitNorm::HyperConnectionHead(exit) if hyper_connections => {
+        (ExitNorm::HyperConnectionHead(exit), ResidualForm::HyperConnections(_)) => {
             match &exit.site {
                 ExitSite::Own(site) => {
                     validate_low_rank(site, context, role)?;
@@ -2935,6 +3529,10 @@ pub(crate) fn validate_exit_norm(
                 ExitSite::Mean => {}
             }
             validate_mixed_norm(exit.norm.as_ref(), context, role)
+        }
+        (ExitNorm::BlockAttention { query, norm }, ResidualForm::BlockAttention { .. }) => {
+            expect_shape(query, &[context.hidden], "block-attention exit query")?;
+            validate_rms(norm, context.hidden, role)
         }
         _ => Err(DefinitionError::new(format!(
             "{role} disagrees with the residual form"

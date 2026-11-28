@@ -391,6 +391,9 @@ pub(in crate::experts) enum DemandSlotClaim {
 pub(super) struct Directory {
     /// The bank's records: what each holds, and the maps naming them.
     bank: BankRecords,
+    /// For each physical stack `s`, its last logical visit index in execution
+    /// order (for unmap safety, publication, and future-read checks).
+    last_visits: Vec<usize>,
     /// Per group, each member layer's map word of its expert 0 and the
     /// layer (`ExpertBankPlan::home`), in map order.
     homes: Vec<Vec<(usize, usize)>>,
@@ -639,7 +642,7 @@ impl Exits<'_> {
             let ranker = reuse.ranker(group, Tier::HOST, Reader::Move);
             let read = beside(&directory.prompt_reads, staged, reuse.last(layer, expert));
             let at = host.progress().map(|p| (p.sequence, p.layer));
-            let admit = outranking(ranker, &directory.prompt_reads, &directory.token_reads, at, ranker.rank(layer, expert, read));
+            let admit = outranking(ranker, &directory.prompt_reads, &directory.token_reads, &directory.last_visits, at, ranker.rank(layer, expert, read));
             let displaced = *self.displaced.get_or_init(|| host.displaced(|staged, read| admit.rank(staged, read), host.reserve()));
             admitted(displaced, |kept, victim| admit.admits(kept, victim)).then_some(read_step)
         })();
@@ -670,20 +673,21 @@ impl BankRecord {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct HostRecord(pub u32);
 
-/// Whether a landing recorded for `(layer, read_step)` is still a *future*
-/// unconsumed read-ahead relative to the device's current position
-/// `at = Some((current_step, current_layer))`.
+/// Whether a landing recorded for `(last_visit, read_step)` is still a *future*
+/// unconsumed read-ahead relative to the device's current logical visit
+/// `at = Some((current_step, current_visit))`.
 ///
-/// A demand landing at `(S, L)` is already consumed once the device is at
-/// `(S, L)` or any later layer `(S, L')` (`L' >= L`), or any later step
-/// `S' > S`. Only landings strictly ahead of the device (`read_step > current_step`
-/// or `read_step == current_step && layer > current_layer`) are unconsumed
+/// A demand landing for a physical stack whose final visit is `last_visit` at
+/// step `S` is already consumed once the device is at `(S, V)` with
+/// `V >= last_visit`, or any later step `S' > S`. Only landings strictly ahead
+/// of the device (`read_step > current_step` or
+/// `read_step == current_step && last_visit > current_visit`) are unconsumed
 /// read-aheads eligible for the `+1.0` [`Unlogged`] override.
 #[inline]
-fn is_future_read(layer: usize, read_step: Step, at: Option<(Step, usize)>) -> bool {
+fn is_future_read(last_visit: usize, read_step: Step, at: Option<(Step, usize)>) -> bool {
     match at {
-        Some((current_step, current_layer)) => {
-            read_step > current_step || (read_step == current_step && layer > current_layer)
+        Some((current_step, current_visit)) => {
+            read_step > current_step || (read_step == current_step && last_visit > current_visit)
         }
         None => true,
     }
@@ -698,29 +702,32 @@ fn beside(prompt_reads: &HashMap<Staged, Unlogged>, staged: Staged, read: Option
 
 /// How the host records rank what they keep, by a lock-free `ranker`
 /// snapshotted once for the group at its tier's τ for `reader`, scoped at
-/// device position `at = Some((current_step, current_layer))`: only future
-/// unconsumed read-aheads (`is_future_read`) and active prompt reads receive
-/// the `+1.0` `Unlogged` override, while `last` still records `read` so
-/// recency tie-breaks are preserved without making already-served demand
-/// misses immune to eviction.
+/// device position `at = Some((current_step, current_visit))`: only future
+/// unconsumed read-aheads (`is_future_read` using `last_visits[stack]`) and
+/// active prompt reads receive the `+1.0` `Unlogged` override, while `last`
+/// still records `read` so recency tie-breaks are preserved without making
+/// already-served demand misses immune to eviction. Always normalized by the
+/// stack's record footprint (`Ranker::rank_at`) so candidates and victims are
+/// compared in identical hits-per-byte units.
 fn store_rank<'a>(
     ranker: Ranker<'a>,
     prompt_reads: &'a HashMap<Staged, Unlogged>,
     token_reads: &'a HashMap<Staged, (Step, f64)>,
+    last_visits: &'a [usize],
     at: Option<(Step, usize)>,
 ) -> impl Fn(Staged, Option<Step>) -> Rank + Copy + 'a {
     move |staged @ (layer, expert): Staged, read: Option<Step>| {
         let prompt = prompt_reads.get(&staged).copied();
-        let future_read = read.filter(|&step| is_future_read(layer, step, at)).map(Unlogged::at);
+        let last_visit = last_visits[layer];
+        let future_read = read.filter(|&step| is_future_read(last_visit, step, at)).map(Unlogged::at);
         let certain = future_read.max(prompt).map(|u| (u.step, 1.0));
         let token = token_reads
             .get(&staged)
             .copied()
-            .filter(|&(step, _)| is_future_read(layer, step, at));
+            .filter(|&(step, _)| is_future_read(last_visit, step, at));
         let override_read = certain.or(token);
-        let expected = ranker.expected_with_override(layer, expert, override_read);
-        let last = ranker.last(layer, expert).max(read).max(prompt.map(|u| u.step));
-        Rank::new(expected, last)
+        let last = read.max(prompt.map(|u| u.step));
+        ranker.rank_at_with_override(layer, expert, override_read, last)
     }
 }
 
@@ -753,10 +760,11 @@ fn outranking<'a>(
     ranker: Ranker<'a>,
     prompt_reads: &'a HashMap<Staged, Unlogged>,
     token_reads: &'a HashMap<Staged, (Step, f64)>,
+    last_visits: &'a [usize],
     at: Option<(Step, usize)>,
     candidate: Rank,
 ) -> impl Admit<Key = Rank> + 'a {
-    (store_rank(ranker, prompt_reads, token_reads, at), move |kept: Kept, victim: Rank| kept == Kept::Banked || victim < candidate)
+    (store_rank(ranker, prompt_reads, token_reads, last_visits, at), move |kept: Kept, victim: Rank| kept == Kept::Banked || victim < candidate)
 }
 
 /// A group's wanted experts as their copies price them
@@ -872,8 +880,42 @@ impl Directory {
         host: HostTier,
         max_depths: usize,
     ) -> Self {
+        let last_visits = (0..layers.len()).collect::<Vec<_>>();
+        let footprints = vec![1u64; layers.len()];
+        Self::new_with_stacks_and_depths(records, layers, experts, &last_visits, &footprints, host, max_depths)
+    }
+
+    /// [`Self::new`] for decoupled physical stacks: `layers` and `experts` are
+    /// indexed by `physical_stack` (`0..P-1`), `last_visits[s]` is the last
+    /// `visit_layer` in execution order for physical stack `s` (for unmap
+    /// safety), and `footprints[s]` is the record byte footprint / granule
+    /// count for hits-per-byte normalized eviction ranking.
+    pub fn new_with_stacks(
+        records: &[usize],
+        layers: &[usize],
+        experts: &[usize],
+        last_visits: &[usize],
+        footprints: &[u64],
+        host: HostTier,
+    ) -> Self {
+        Self::new_with_stacks_and_depths(records, layers, experts, last_visits, footprints, host, super::DEPTHS)
+    }
+
+    /// [`Self::new_with_stacks`] sized to the load's actual maximum decode
+    /// depth (`max_depths`, clamped to `1..=DEPTHS`).
+    pub fn new_with_stacks_and_depths(
+        records: &[usize],
+        layers: &[usize],
+        experts: &[usize],
+        last_visits: &[usize],
+        footprints: &[u64],
+        host: HostTier,
+        max_depths: usize,
+    ) -> Self {
         assert_eq!(host.records.len(), records.len(), "each group has its host tier");
         assert_eq!(host.lent.len(), records.len(), "each group's host tier lends");
+        assert_eq!(last_visits.len(), layers.len(), "each physical stack has its last visit");
+        assert_eq!(footprints.len(), layers.len(), "each physical stack has its footprint");
         // The plan's homes (`layer_homes`), which the device reads too.
         let mut homes = vec![Vec::<(usize, usize)>::new(); records.len()];
         let placed = crate::planning::layer_homes(layers.iter().zip(experts).map(|(&group, &experts)| (group, experts as u64)));
@@ -882,7 +924,7 @@ impl Directory {
         }
         let placer = host.placement.placer();
         let HostTier { records: host_records, lent: host_lent, reserve: host_reserve, placement } = host;
-        // The maps the host records write, one per layer, where the
+        // The maps the host records write, one per physical stack, where the
         // placement writes any.
         let (bank_maps, maps) = match placement {
             Placement::Tier { bank_maps, tier_maps, lent, stage_slots } => {
@@ -892,13 +934,13 @@ impl Directory {
             Placement::Replay => (None, None),
         };
         if let Some(maps) = &maps {
-            assert_eq!(maps.len(), layers.len(), "each layer has its map");
+            assert_eq!(maps.len(), layers.len(), "each physical stack has its map");
         }
-        // Each group's members, each layer with its map.
+        // Each group's members, each physical stack with its map.
         let mut members = (0..records.len()).map(|_| Vec::new()).collect::<Vec<_>>();
         let mut maps = maps.map(Vec::into_iter);
         for (layer, (&group, &experts)) in layers.iter().zip(experts).enumerate() {
-            members[group].push((layer, experts, maps.as_mut().map(|maps| maps.next().expect("each layer has its map"))));
+            members[group].push((layer, experts, maps.as_mut().map(|maps| maps.next().expect("each physical stack has its map"))));
         }
         let inbound = Arc::new(InboundTable::new(experts));
         let resolution = match placer {
@@ -909,9 +951,13 @@ impl Directory {
             .iter()
             .zip(members)
             .zip(host_lent)
-            .map(|((&count, members), lent)| HostRecords::new(count, layers.len(), members, resolution, (lent, host_reserve), inbound.clone()))
+            .map(|((&count, members), lent)| {
+                HostRecords::new(count, layers.len(), members, resolution, (lent, host_reserve), inbound.clone())
+                    .with_last_visits(last_visits.to_vec())
+            })
             .collect::<Vec<_>>();
-        let bank = BankRecords::new(records, &layers.iter().copied().zip(experts.iter().copied()).collect::<Vec<_>>(), bank_maps);
+        let bank = BankRecords::new(records, &layers.iter().copied().zip(experts.iter().copied()).collect::<Vec<_>>(), bank_maps)
+            .with_last_visits(last_visits.to_vec());
         // The ranking's pools: each group's decode capacity
         // ([`Self::capacity`]).
         let kept: Vec<usize> = match placer {
@@ -926,6 +972,7 @@ impl Directory {
         };
         Self {
             bank,
+            last_visits: last_visits.to_vec(),
             homes,
             placer,
             host,
@@ -933,7 +980,7 @@ impl Directory {
             whole_layers: Arc::from([]),
             prompt_reads: HashMap::new(),
             token_reads: HashMap::new(),
-            ranking: Reuse::ranking_with_depth(experts, layers, &kept, time.clone(), max_depths),
+            ranking: Reuse::ranking_with_footprints_and_depth(experts, layers, &kept, footprints, time.clone(), max_depths),
             wanted: vec![BTreeSet::new(); layers.len()],
             unwanted: vec![BTreeSet::new(); layers.len()],
             stirred: false,
@@ -1032,6 +1079,14 @@ impl Directory {
     /// The ranking as it is now.
     pub(in crate::experts) fn reuse_now(&self) -> std::sync::MutexGuard<'_, Reuse> {
         Reuse::of(&self.ranking)
+    }
+
+    /// Configure each physical stack's logical visit frequency per decode step
+    /// (`>= 1`) in [`Reuse`] so pooled demand weights looped stacks
+    /// proportionally to their marginal expected uses per charged byte.
+    pub fn set_visit_counts(&mut self, visit_counts: &[usize]) {
+        self.reuse_now().set_visit_counts(visit_counts);
+        self.stirred = true;
     }
 
     /// Decode's capacity in group `group`, the one count of the records
@@ -1368,13 +1423,13 @@ impl Directory {
         let at = self.host[group].progress().map(|p| (p.sequence, p.layer));
         let credit = if stall_credit.is_finite() && stall_credit > 0.0 { stall_credit } else { 0.0 };
         if credit > 0.0 {
-            let effective_uses = candidate.expected().uses() + credit;
-            let admit = (store_rank(ranker, &self.prompt_reads, &self.token_reads, at), move |kept: Kept, victim: Rank| {
+            let effective_uses = candidate.expected().uses() + credit / ranker.footprint(layer) as f64;
+            let admit = (store_rank(ranker, &self.prompt_reads, &self.token_reads, &self.last_visits, at), move |kept: Kept, victim: Rank| {
                 kept == Kept::Banked || victim < candidate || effective_uses > victim.expected().uses()
             });
             self.host[group].claim((layer, expert), keep, taking, admit)
         } else {
-            self.host[group].claim((layer, expert), keep, taking, outranking(ranker, &self.prompt_reads, &self.token_reads, at, candidate))
+            self.host[group].claim((layer, expert), keep, taking, outranking(ranker, &self.prompt_reads, &self.token_reads, &self.last_visits, at, candidate))
         }
     }
 
@@ -1385,8 +1440,9 @@ impl Directory {
     ///   `cand_uses > victim.expected().uses()` so a colder or tied carryover
     ///   never evicts a resident or causes tie-churn drive misses.
     /// - Otherwise (non-drive-bound free slack hides the read), credit the
-    ///   avoided exposed synchronous stall against the victim's turnover margin:
-    ///   `cand_uses + net_benefit_uses > victim.expected().uses()`.
+    ///   avoided exposed synchronous stall against the victim's turnover margin
+    ///   in footprint-normalized units:
+    ///   `cand_uses + net_benefit_uses / footprint[cand] > victim.expected().uses()`.
     #[allow(clippy::too_many_arguments)]
     pub fn claim_carryover(
         &mut self,
@@ -1407,14 +1463,14 @@ impl Directory {
         let reuse = Reuse::of(&self.ranking);
         let ranker = reuse.ranker(group, tier, Reader::Move);
         let at = self.host[group].progress().map(|p| (p.sequence, p.layer));
-        let candidate = store_rank(ranker, &self.prompt_reads, &self.token_reads, at)((layer, expert), None);
+        let candidate = store_rank(ranker, &self.prompt_reads, &self.token_reads, &self.last_visits, at)((layer, expert), None);
         let cand_uses = candidate.expected().uses();
         let effective_uses = if strict_rank {
             cand_uses
         } else {
-            cand_uses + net_benefit_uses
+            cand_uses + net_benefit_uses / ranker.footprint(layer) as f64
         };
-        let admit = (store_rank(ranker, &self.prompt_reads, &self.token_reads, at), move |kept: Kept, victim: Rank| {
+        let admit = (store_rank(ranker, &self.prompt_reads, &self.token_reads, &self.last_visits, at), move |kept: Kept, victim: Rank| {
             if kept == Kept::Banked {
                 return true;
             }
@@ -1483,8 +1539,8 @@ impl Directory {
         let reuse = Reuse::of(&self.ranking);
         let ranker = reuse.ranker(group, tier, Reader::Move);
         let at = self.host[group].progress().map(|p| (p.sequence, p.layer));
-        let candidate = store_rank(ranker, &self.prompt_reads, &self.token_reads, at)((layer, expert), read);
-        self.host[group].claim((layer, expert), 0, Taking::Out, outranking(ranker, &self.prompt_reads, &self.token_reads, at, candidate))
+        let candidate = store_rank(ranker, &self.prompt_reads, &self.token_reads, &self.last_visits, at)((layer, expert), read);
+        self.host[group].claim((layer, expert), 0, Taking::Out, outranking(ranker, &self.prompt_reads, &self.token_reads, &self.last_visits, at, candidate))
     }
 
     /// Where `layer`'s `expert` is in its group's host tier: lacked
@@ -1558,10 +1614,10 @@ impl Directory {
         self.whole_layers = whole;
     }
 
-    /// Whether `layer` currently has `POLICY_WHOLE` published on the device.
+    /// Whether physical stack `layer` currently has `POLICY_WHOLE` published on the device.
     fn is_layer_whole_published(&self, layer: usize) -> bool {
         self.whole_layers
-            .get(layer)
+            .get(self.bank.last_visit(layer))
             .is_some_and(|flag| flag.load(Ordering::Acquire))
     }
 
@@ -1641,13 +1697,13 @@ impl Directory {
         let token_protected = |kept: Staged| {
             self.token_reads
                 .get(&kept)
-                .is_some_and(|&(step, _)| is_future_read(kept.0, step, at))
+                .is_some_and(|&(step, _)| is_future_read(self.last_visits[kept.0], step, at))
         };
         if let Some(claim) = self.host[group].claim_prepared((layer, expert), demand, read, token_protected, park) {
             return claim;
         }
         let reuse = Reuse::of(&self.ranking);
-        let rank = store_rank(reuse.ranker(group, self.host_tier(), Reader::Move), &self.prompt_reads, &self.token_reads, at);
+        let rank = store_rank(reuse.ranker(group, self.host_tier(), Reader::Move), &self.prompt_reads, &self.token_reads, &self.last_visits, at);
         let protected = |staged: Staged, read: Option<Step>| (token_protected(staged), rank(staged, read));
         self.host[group].claim_demand((layer, expert), demand, protected, read, park)
     }
@@ -1673,13 +1729,17 @@ impl Directory {
         let layers = self.layer_groups().iter().filter(|&&of| of == group).count().max(1);
         let depth = (needed * layers).min(self.host[group].records() as usize);
         let reuse = Reuse::of(&self.ranking);
-        let at = Some((sequence, layer));
-        let rank = store_rank(reuse.ranker(group, self.host_tier(), Reader::Move), &self.prompt_reads, &self.token_reads, at);
+        let at = self.host[group]
+            .progress()
+            .filter(|p| p.sequence >= sequence)
+            .map(|p| (p.sequence, p.layer))
+            .or(Some((sequence, self.last_visits[layer])));
+        let rank = store_rank(reuse.ranker(group, self.host_tier(), Reader::Move), &self.prompt_reads, &self.token_reads, &self.last_visits, at);
         let protected = |staged: Staged, read: Option<Step>| {
             let token = self
                 .token_reads
                 .get(&staged)
-                .is_some_and(|&(step, _)| is_future_read(staged.0, step, at));
+                .is_some_and(|&(step, _)| is_future_read(self.last_visits[staged.0], step, at));
             (token, rank(staged, read))
         };
         self.host[group].prepare_demand(protected, depth, sequence);
@@ -1748,16 +1808,17 @@ impl Directory {
             .enumerate()
             .map(|(group, records)| {
                 let at = records.progress().map(|p| (p.sequence, p.layer));
-                let rank = store_rank(reuse.ranker(group, tier, Reader::Move), &self.prompt_reads, &self.token_reads, at);
+                let rank = store_rank(reuse.ranker(group, tier, Reader::Move), &self.prompt_reads, &self.token_reads, &self.last_visits, at);
                 // Protect strictly future unconsumed read-aheads from immediate
                 // eviction before their step/layer runs; already-served demand
                 // landings at or behind `at` are not protected.
                 let protected = |staged @ (layer, _): Staged, read: Option<Step>| {
-                    let unconsumed = read.is_some_and(|step| is_future_read(layer, step, at) && reuse.lead_of(layer, step).is_some())
+                    let last_visit = self.last_visits[layer];
+                    let unconsumed = read.is_some_and(|step| is_future_read(last_visit, step, at) && reuse.lead_of(layer, step).is_some())
                         || self
                             .token_reads
                             .get(&staged)
-                            .is_some_and(|&(step, _)| is_future_read(layer, step, at));
+                            .is_some_and(|&(step, _)| is_future_read(last_visit, step, at));
                     (unconsumed, rank(staged, read))
                 };
                 let file_lacked = records.lacked().saturating_sub(self.vram_lacked_in_group(group));
@@ -1775,6 +1836,7 @@ impl Directory {
         let reuse = Reuse::of(&self.ranking);
         let prompt_reads = &self.prompt_reads;
         let token_reads = &self.token_reads;
+        let last_visits = &self.last_visits;
         let placer = self.placer;
         let bank = &self.bank;
         self.host
@@ -1782,12 +1844,13 @@ impl Directory {
             .enumerate()
             .map(|(group, records)| {
                 let at = records.progress().map(|p| (p.sequence, p.layer));
-                let rank = store_rank(reuse.ranker(group, tier, Reader::Move), prompt_reads, token_reads, at);
+                let rank = store_rank(reuse.ranker(group, tier, Reader::Move), prompt_reads, token_reads, last_visits, at);
                 let is_protected = |staged @ (layer, _): Staged, read: Option<Step>| {
-                    read.is_some_and(|step| is_future_read(layer, step, at) && reuse.lead_of(layer, step).is_some())
+                    let last_visit = last_visits[layer];
+                    read.is_some_and(|step| is_future_read(last_visit, step, at) && reuse.lead_of(layer, step).is_some())
                         || token_reads
                             .get(&staged)
-                            .is_some_and(|&(step, _)| is_future_read(layer, step, at))
+                            .is_some_and(|&(step, _)| is_future_read(last_visit, step, at))
                 };
                 let protected = |staged: Staged, read: Option<Step>| (is_protected(staged, read), rank(staged, read));
                 let vram_lacked = if placer != crate::planning::Placer::Tier {
@@ -1816,6 +1879,39 @@ impl Directory {
             .iter_mut()
             .zip(victims)
             .fold(false, |unmapped, (records, victims)| unmapped | records.refill_with(victims, at, immediate))
+    }
+
+    /// Whether any host tier lacks a ready record beyond its cut-in pool for an
+    /// active `tier_copy_dma` prefill demand landing.
+    pub fn needs_scratch_dma_reclaim(&self) -> bool {
+        self.host.iter().any(|records| !records.has_ready_beyond_pool())
+    }
+
+    /// Immediately release all `Host::Graced` records across every host tier
+    /// (valid strictly under `tier_copy_dma && at.all_scratch()`).
+    pub fn retire_graces_immediate(&mut self) -> bool {
+        self.host.iter_mut().fold(false, |freed, records| freed | records.retire_immediate())
+    }
+
+    /// Victims to evict immediately into `Host::Ready` for active
+    /// `tier_copy_dma` prefill demand that is blocked on `ready.len() <= pool`.
+    pub fn scratch_dma_victims(&self, lending: bool) -> Vec<Vec<(u32, Staged)>> {
+        let reuse = self.reuse_now();
+        let tier = self.host_tier();
+        self.host
+            .iter()
+            .enumerate()
+            .map(|(group, records)| {
+                let at = records.progress().map(|p| (p.sequence, p.layer));
+                let rank = store_rank(reuse.ranker(group, tier, Reader::Move), &self.prompt_reads, &self.token_reads, &self.last_visits, at);
+                records.reclaim_victims_for_scratch_dma(rank, lending)
+            })
+            .collect()
+    }
+
+    /// Concise per-group host-tier state for watchdog / SIGUSR1 reports.
+    pub fn describe_host(&self) -> Vec<String> {
+        self.host.iter().map(HostRecords::describe).collect()
     }
 
     /// Group `group`'s host tier sets `records` ready records aside for
@@ -2184,7 +2280,7 @@ impl Directory {
         };
         let ranker = reuse.ranker(group, Tier::COMPUTE, Reader::Move);
         let mut released = held.iter().map(|&((layer, expert), record)| (self.ranked(ranker, layer, expert, None), record)).collect::<Vec<_>>();
-        let mut floor = held.iter().map(|&(staged, _)| self.uses(ranker, staged)).collect::<Vec<_>>();
+        let mut floor = held.iter().map(|&(staged, _)| self.uses(ranker, staged) / ranker.footprint(staged.0) as f64).collect::<Vec<_>>();
         if held.len() > most {
             released.select_nth_unstable(most);
             released.truncate(most);
@@ -2222,8 +2318,9 @@ impl Directory {
             .into_iter()
             .filter_map(|staged| {
                 self.copy_hits[staged.0].map(|hits| {
+                    let inv = 1.0 / ranker.footprint(staged.0) as f64;
                     let uses = self.uses(ranker, staged);
-                    (uses - hits, uses, staged)
+                    ((uses - hits) * inv, uses * inv, staged)
                 })
             })
             .collect::<Vec<_>>();
@@ -2289,7 +2386,7 @@ impl Directory {
             let candidate = ranker.rank(staged.0, staged.1, beside(&self.prompt_reads, staged, read));
             let keep = self.host[group].reserve();
             let at = self.host[group].progress().map(|p| (p.sequence, p.layer));
-            match self.host[group].claim_back(staged, keep, outranking(ranker, &self.prompt_reads, &self.token_reads, at, candidate)) {
+            match self.host[group].claim_back(staged, keep, outranking(ranker, &self.prompt_reads, &self.token_reads, &self.last_visits, at, candidate)) {
                 Some(grant) => {
                     let tier = HostRecord(grant.record());
                     self.backs.insert((group, record), (grant, read));
@@ -2584,7 +2681,8 @@ impl Directory {
         // Only the records' change and its mapping under the steps' lock;
         // what the tier and the ranking learn of it after, outside it.
         let bank = &mut self.bank;
-        let promoted = steps.unresolved(progress, |unresolved| bank.promoted(completed, |layer| unresolved.from(layer)));
+        let last_visits = &self.last_visits;
+        let promoted = steps.unresolved(progress, |unresolved| bank.promoted(completed, |stack| unresolved.from(last_visits[stack])));
         promoted
             .into_iter()
             .map(|((layer, expert), record, tier)| {
@@ -2697,9 +2795,10 @@ impl Directory {
                     continue;
                 }
                 let from = self.bank.map_from(v_layer, v_expert);
-                let unmap_until = UnmapStep::from(park.unresolved(v_layer));
-                if !park.frees(v_layer, from, until.step())
-                    || !is_served(from, unmap_until.step(), v_layer, progress)
+                let v_last_visit = self.last_visits[v_layer];
+                let unmap_until = UnmapStep::from(park.unresolved(v_last_visit));
+                if !park.frees(v_last_visit, from, until.step())
+                    || !is_served(from, unmap_until.step(), v_last_visit, progress)
                 {
                     continue;
                 }
@@ -2721,7 +2820,8 @@ impl Directory {
                 if self.is_layer_whole_published(v_layer) {
                     continue;
                 }
-                let unmap_until = UnmapStep::from(park.unresolved(v_layer));
+                let v_last_visit = self.last_visits[v_layer];
+                let unmap_until = UnmapStep::from(park.unresolved(v_last_visit));
                 for v_expert in 0..self.bank.experts(v_layer) {
                     let Some(record) = self.bank.held(v_layer, v_expert) else {
                         continue;
@@ -2733,8 +2833,8 @@ impl Directory {
                         continue;
                     }
                     let from = self.bank.map_from(v_layer, v_expert);
-                    if !park.frees(v_layer, from, until.step())
-                        || !is_served(from, unmap_until.step(), v_layer, progress)
+                    if !park.frees(v_last_visit, from, until.step())
+                        || !is_served(from, unmap_until.step(), v_last_visit, progress)
                     {
                         continue;
                     }
@@ -3076,7 +3176,7 @@ impl Directory {
                     let tier_complete = self.host[group].complete();
                     let in_top = reuse.in_top(layer, expert);
                     let ranker = reuse.ranker(group, Tier::COMPUTE, Reader::Move);
-                    let staged_uses = self.uses(ranker, staged);
+                    let staged_uses = self.uses(ranker, staged) / ranker.footprint(layer) as f64;
 
                     if *free_now >= free_floor && *held_total + replenish_target < cap {
                         // On 3-tier (`!tier_complete`) groups, only promote
@@ -3125,7 +3225,7 @@ impl Directory {
                                     if !v_evictable {
                                         continue;
                                     }
-                                    let v_uses = self.uses(ranker, (v_layer, v_expert));
+                                    let v_uses = self.uses(ranker, (v_layer, v_expert)) / ranker.footprint(v_layer) as f64;
                                     unwanted.push(((v_layer, v_expert), v_record, v_uses, true));
                                 }
                             }
@@ -3147,7 +3247,10 @@ impl Directory {
                                 let max_staged_uses = batch
                                     .iter()
                                     .filter_map(|&(g, _, st, _)| {
-                                        (g == group).then_some(st).flatten().map(|s| self.uses(ranker, s))
+                                        (g == group)
+                                            .then_some(st)
+                                            .flatten()
+                                            .map(|s| self.uses(ranker, s) / ranker.footprint(s.0) as f64)
                                     })
                                     .fold(f64::NEG_INFINITY, f64::max);
                                 let order = reuse.top_order(group);
@@ -3209,7 +3312,7 @@ impl Directory {
                                     if !v_evictable {
                                         continue;
                                     }
-                                    let v_uses = self.uses(ranker, (v_layer, v_expert));
+                                    let v_uses = self.uses(ranker, (v_layer, v_expert)) / ranker.footprint(v_layer) as f64;
                                     let v_wanted = !self.unwanted[v_layer].contains(&v_expert);
                                     all.push((v_wanted, v_uses, (v_layer, v_expert), v_record));
                                 }
@@ -3248,8 +3351,9 @@ impl Directory {
                     // Re-check duplicate promotion within the same batch.
                     if self.bank.held(layer, expert).is_none() && !self.bank.placing_contains(staged) {
                         let bank = &mut self.bank;
+                        let last_visits = &self.last_visits;
                         let promoted = steps.unresolved(progress, |unresolved| {
-                            bank.promote_demand_landing(group, record, staged, |l| unresolved.from(l))
+                            bank.promote_demand_landing(group, record, staged, |stack| unresolved.from(last_visits[stack]))
                         });
                         if promoted {
                             self.time.lock().moved(group, Tier::COMPUTE);
@@ -3276,7 +3380,8 @@ impl Directory {
                             // `back: Some(..)` BEFORE promoting `B`. If no write-back
                             // slot is safely available, abort without touching `A`/`B`/`C`
                             // so a VRAM-only victim is never dropped to NVMe.
-                            let swapped = steps.unbegun_with_served(progress, self.bank.layers(), |at, _park, is_served| {
+                            let total_visits = self.last_visits.iter().copied().max().map_or(self.bank.layers(), |v| v + 1);
+                            let swapped = steps.unbegun_with_served(progress, total_visits, |at, _park, is_served| {
                                 let immediate = tier_copy_dma && at.all_scratch();
                                 let (exit, reclaimed_slot) = self.exit_into_slot(
                                     group,
@@ -3297,8 +3402,9 @@ impl Directory {
                             });
                             if let Some(reclaimed_slot) = swapped {
                                 let bank = &mut self.bank;
+                                let last_visits = &self.last_visits;
                                 let promoted = steps.unresolved(progress, |unresolved| {
-                                    bank.promote_demand_landing(group, record, staged, |l| unresolved.from(l))
+                                    bank.promote_demand_landing(group, record, staged, |stack| unresolved.from(last_visits[stack]))
                                 });
                                 assert!(promoted, "pre-validated demand landing promotion must succeed");
                                 self.left_bank(victim.0, victim.1, None);
@@ -3313,8 +3419,9 @@ impl Directory {
                             }
                         } else {
                             let bank = &mut self.bank;
+                            let last_visits = &self.last_visits;
                             let promoted = steps.unresolved(progress, |unresolved| {
-                                bank.promote_demand_landing(group, record, staged, |l| unresolved.from(l))
+                                bank.promote_demand_landing(group, record, staged, |stack| unresolved.from(last_visits[stack]))
                             });
                             if promoted {
                                 let exit = self.exit_now(group, victim_record, victim);
@@ -3396,7 +3503,7 @@ impl Directory {
         let excess = self.host[group].records().saturating_sub(target) as usize;
         let reuse = Reuse::of(&self.ranking);
         let at = self.host[group].progress().map(|p| (p.sequence, p.layer));
-        let rank = store_rank(reuse.ranker(group, self.host_tier(), Reader::Observe), &self.prompt_reads, &self.token_reads, at);
+        let rank = store_rank(reuse.ranker(group, self.host_tier(), Reader::Observe), &self.prompt_reads, &self.token_reads, &self.last_visits, at);
         let mut evicted = self.host[group].evictable_filtered(rank, skip_protected);
         evicted.truncate(excess);
         evicted
@@ -3560,7 +3667,7 @@ impl Directory {
             if copy.is_some() && self.host[lender].capacity() > 0 {
                 let reuse = Reuse::of(&self.ranking);
                 let at = self.host[lender].progress().map(|p| (p.sequence, p.layer));
-                let rank = store_rank(reuse.ranker(lender, tier, Reader::Move), &self.prompt_reads, &self.token_reads, at);
+                let rank = store_rank(reuse.ranker(lender, tier, Reader::Move), &self.prompt_reads, &self.token_reads, &self.last_visits, at);
                 self.host[lender].lease_records(scratch_group, target_records, rank, may_evict, copy).1
             } else {
                 self.host[lender].lease_records(scratch_group, target_records, |_, _| 0u64, false, None).1

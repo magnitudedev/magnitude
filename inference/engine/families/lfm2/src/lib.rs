@@ -21,7 +21,8 @@ use magnitude_artifacts::{
 };
 use magnitude_family_common::{rotary, Metadata, Tensors};
 use magnitude_family_contracts::{
-    checked_product, ActivationDType, ActivationFunction, Attention, AttentionGate, Block, Decoder,
+    checked_product, ActivationDType, ActivationFunction, Attention, AttentionGate, AttentionSinks,
+    Block, Decoder,
     DenseFfn, EmbeddingScale, EntryForm, ExitForm, ExitNorm, ExpertSelection, FamilyId,
     FeedForwardUp, GateFunction, GateGranularity, HeadNorm, HistoryRows, HistorySource,
     InputNorm, InputSemantics, MediaRowAttention, ModelDefinition,
@@ -160,6 +161,8 @@ impl Layers<'_> {
                                 "attn_v.weight",
                                 &[kv_rows, hidden],
                             )?),
+                            key_conv: None,
+                            value_conv: None,
                             key_norm: HeadNorm::Rms(rms(weight("attn_k_norm.weight", &[width])?)),
                             value_norm: ValueNorm::None,
                             domain: *domain,
@@ -167,9 +170,11 @@ impl Layers<'_> {
                         }),
                     ))],
                     rotary: rotary.clone(),
+                    relative_bias: None,
+                    log_scale: None,
                     scale: 1.0 / (width as f64).sqrt(),
                     media_rows: MediaRowAttention::Causal,
-                    sinks: None,
+                    sinks: AttentionSinks::None,
                     output: OutputProjection::Full(weight(
                         "attn_output.weight",
                         &[hidden, head_rows],
@@ -273,14 +278,17 @@ impl Layers<'_> {
                 Sublayer {
                     input: InputNorm::Rms(rms(weight("attn_norm.weight", &[hidden])?)),
                     op,
+                    post_conv: None,
                     output: operator_output,
                 },
                 Sublayer {
                     input: InputNorm::Rms(rms(weight("ffn_norm.weight", &[hidden])?)),
                     op: feed_forward,
+                    post_conv: None,
                     output: feed_forward_output,
                 },
             ],
+            transition: None,
         })
     }
 }
@@ -532,6 +540,7 @@ pub fn inspect_components(
                 norm: ExitNorm::Rms(rms(output_norm)),
                 output,
                 softcap: None,
+                unpadded_vocabulary: None,
             },
         },
         head: None,

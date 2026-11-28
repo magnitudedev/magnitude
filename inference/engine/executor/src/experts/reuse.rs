@@ -40,7 +40,7 @@ use super::interest::Stands;
 use super::watcher::Step;
 use super::yielding::Yielding;
 use super::DEPTHS;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, MutexGuard};
 
 /// What a read logged into the ranking is evidence of: a decode step's
@@ -308,6 +308,46 @@ impl Expected {
     pub fn sooner(self) -> f64 {
         self.s
     }
+
+    /// Scale expected uses by `visits` (the physical stack's logical visit
+    /// frequency per decode step, `>= 1`) so looped stacks earn capacity
+    /// proportional to marginal expected uses per charged byte.
+    pub fn scaled(self, visits: usize) -> Self {
+        assert!(visits >= 1, "visit count must be positive");
+        if visits == 1 {
+            return self;
+        }
+        let scale = visits as f64;
+        Self::new(self.n * scale, self.s * scale)
+    }
+
+    /// Normalize expected uses by `footprint` (record byte size or granule
+    /// count) so pooled eviction ranks by hits-per-byte
+    /// (`expert-streaming.md` §5 & §7).
+    pub fn normalized(self, footprint: u64) -> Self {
+        assert!(footprint > 0, "record footprint must be positive");
+        if footprint == 1 {
+            return self;
+        }
+        let inv = 1.0 / footprint as f64;
+        Self::new(self.n * inv, self.s * inv)
+    }
+
+    /// Add an intra-step (same-step, lead 0) expected use `same_step` ∈ [0, 1]
+    /// from an earlier visit of the same physical stack in the current step.
+    pub(super) fn with_same_step(self, same_step: f64, horizon: horizon::Horizon, a_bar: f64) -> Self {
+        if same_step == 0.0 {
+            return self;
+        }
+        assert!(same_step.is_finite() && (0.0..=1.0).contains(&same_step), "invalid same-step probability {same_step}");
+        match horizon {
+            horizon::Horizon::Tokens(tau) => {
+                let m = (tau.get() / a_bar).floor();
+                Self::new(self.n + same_step, self.s + (m + 1.0) * same_step)
+            }
+            horizon::Horizon::Unbounded => Self::new(self.n, self.s + same_step),
+        }
+    }
 }
 
 impl Eq for Expected {}
@@ -500,9 +540,37 @@ pub(super) fn expected_for(
     epoch: u64,
     override_lead: Option<(usize, f64)>,
 ) -> Expected {
+    expected_for_visits(calibration, expert, rates, horizon, a_bar, epoch, 1, override_lead)
+}
+
+/// Compute [`Expected`] for a physical stack visited `visits >= 1` times per
+/// decode step. A single-visit `override_lead = Some((g, p))` replaces ONE of
+/// the `visits` visits at step lead `g` with `p`, leaving the remaining
+/// `visits - 1` visits at their baseline probability `old` (`(v - 1)*old + p`).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn expected_for_visits(
+    calibration: &Calibration,
+    expert: usize,
+    rates: &StandRates,
+    horizon: horizon::Horizon,
+    a_bar: f64,
+    epoch: u64,
+    visits: usize,
+    override_lead: Option<(usize, f64)>,
+) -> Expected {
     let probs = lead_probs(calibration, expert, rates, epoch);
     let p_inf = calibration.history_prob(expert, epoch);
-    expected_from(probs, p_inf, horizon, a_bar, override_lead)
+    if visits <= 1 {
+        return expected_from(probs, p_inf, horizon, a_bar, override_lead);
+    }
+    let adjusted_override = override_lead.map(|(lead, p)| {
+        assert!(lead >= 1, "lead must be at least 1");
+        assert!(p.is_finite() && (0.0..=1.0).contains(&p), "invalid override probability {p}");
+        let old = if lead <= DEPTHS { probs[lead - 1] } else { p_inf };
+        let eff = (((visits - 1) as f64) * old + p) / (visits as f64);
+        (lead, eff)
+    });
+    expected_from(probs, p_inf, horizon, a_bar, adjusted_override).scaled(visits)
 }
 
 /// An expert's place in its group's order, least first.
@@ -678,6 +746,23 @@ pub struct Reuse {
     /// Each layer's group, and each group's member layers.
     groups: Vec<usize>,
     members: Vec<usize>,
+    /// Each physical stack's record footprint (byte size or granule count,
+    /// always `> 0`) for hits-per-byte normalized pooled eviction.
+    footprints: Vec<u64>,
+    /// Each physical stack's logical visit frequency per decode step (`>= 1`).
+    visit_counts: Vec<usize>,
+    /// Last decode visit logged per physical stack (`(step, visit_ord, experts)`),
+    /// used to observe ordered visit-pair carryover (`Pass 1 -> Pass 2`,
+    /// `Pass 2 -> Pass 3`) from exact routed experts.
+    last_visit_read: Vec<(Step, usize, Vec<usize>)>,
+    /// Per physical stack, empirical `(hits, seen)` EWMA for each ordered
+    /// adjacent visit transition `from_ord -> from_ord + 1` within a step
+    /// (`len = visit_counts[stack].saturating_sub(1)`).
+    cross_pass_pairs: Vec<Vec<(f64, f64)>>,
+    /// Active intra-step cross-pass foresight per physical stack: experts
+    /// routed at an earlier visit of the stack in `step` with calibrated
+    /// probability `p` of reuse at `dest_visit` in the same step.
+    intra_step: Vec<HashMap<usize, (Step, usize, f64)>>,
     /// The pools of what is read.
     pools: Pools,
     /// Shared time owner (clock, per-(group, tier) turnovers, epochs).
@@ -750,15 +835,17 @@ impl<'a> Ranker<'a> {
             self.group, self.reuse.groups[layer],
         );
         let override_lead = read.and_then(|(step, p)| self.reuse.lead_of(layer, step).map(|lead| (lead, p)));
-        expected_for(
+        expected_for_visits(
             &self.reuse.layers[layer],
             expert,
             &self.rates,
             self.horizon,
             self.a_bar,
             self.epoch,
+            self.reuse.visit_counts[layer],
             override_lead,
         )
+        .with_same_step(self.reuse.same_step(layer, expert), self.horizon, self.a_bar)
     }
 
     /// The step that last read `layer`'s `expert` in the logged history, if any.
@@ -767,20 +854,41 @@ impl<'a> Ranker<'a> {
         self.reuse.layers[layer].last_read(expert)
     }
 
+    /// The record footprint (byte size or granule count) of `layer`.
+    #[inline]
+    pub fn footprint(&self, layer: usize) -> u64 {
+        self.reuse.footprints[layer]
+    }
+
+    /// Footprint-normalized rank for `(layer, expert)` with explicit `unlogged`
+    /// future-read override and `last` recency hint.
+    #[inline]
+    pub fn rank_at(&self, layer: usize, expert: usize, unlogged: Option<Unlogged>, last: Option<Step>) -> Rank {
+        self.rank_at_with_override(layer, expert, unlogged.map(|u| (u.step, 1.0)), last)
+    }
+
+    /// Footprint-normalized rank for `(layer, expert)` with an optional
+    /// `(step, p)` lead probability override and `last` recency hint.
+    #[inline]
+    pub fn rank_at_with_override(&self, layer: usize, expert: usize, override_read: Option<(Step, f64)>, last: Option<Step>) -> Rank {
+        let expected = self.expected_with_override(layer, expert, override_read).normalized(self.reuse.footprints[layer]);
+        Rank::new(expected, self.reuse.layers[layer].last_read(expert).max(last))
+    }
+
     /// [`Reuse::rank`] for `layer` (a member of this ranker's group)
-    /// using the snapshotted `(horizon, a_bar, epoch, rates)`.
+    /// using the snapshotted `(horizon, a_bar, epoch, rates)`, normalized by
+    /// the layer's record footprint (hits-per-byte).
     pub fn rank(&self, layer: usize, expert: usize, read: Option<Unlogged>) -> Rank {
-        let expected = self.expected(layer, expert, read);
-        let last = self.reuse.layers[layer].last_read(expert).max(read.map(|read| read.step));
-        Rank::new(expected, last)
+        self.rank_at(layer, expert, read, read.map(|read| read.step))
     }
 }
 
 impl Reuse {
     /// No read logged of layers of `experts` experts each, in bank groups
-    /// `groups`, whose pools hold `records` records each, timed by `time`.
+    /// `groups`, whose pools hold `records` records each, timed by `time`,
+    /// with uniform record footprint 1.
     pub fn new(experts: &[usize], groups: &[usize], records: &[usize], time: horizon::Time) -> Self {
-        Self::with_depth(experts, groups, records, time, DEPTHS)
+        Self::with_footprints_and_depth(experts, groups, records, &vec![1; experts.len()], time, DEPTHS)
     }
 
     /// [`Self::new`] sized to `max_depths` (`1..=DEPTHS`).
@@ -791,7 +899,33 @@ impl Reuse {
         time: horizon::Time,
         max_depths: usize,
     ) -> Self {
+        Self::with_footprints_and_depth(experts, groups, records, &vec![1; experts.len()], time, max_depths)
+    }
+
+    /// [`Self::new`] with per-stack record `footprints` (byte size or granule
+    /// count, each `> 0`) for hits-per-byte normalized pooled eviction.
+    pub fn with_footprints(
+        experts: &[usize],
+        groups: &[usize],
+        records: &[usize],
+        footprints: &[u64],
+        time: horizon::Time,
+    ) -> Self {
+        Self::with_footprints_and_depth(experts, groups, records, footprints, time, DEPTHS)
+    }
+
+    /// [`Self::new`] with per-stack record `footprints` and `max_depths` (`1..=DEPTHS`).
+    pub fn with_footprints_and_depth(
+        experts: &[usize],
+        groups: &[usize],
+        records: &[usize],
+        footprints: &[u64],
+        time: horizon::Time,
+        max_depths: usize,
+    ) -> Self {
         assert_eq!(experts.len(), groups.len(), "each layer has its group");
+        assert_eq!(experts.len(), footprints.len(), "each layer has its footprint");
+        assert!(footprints.iter().all(|&f| f > 0), "every record footprint must be positive");
         let max_depths = max_depths.clamp(1, DEPTHS);
         let mut members = vec![0; records.len()];
         groups.iter().for_each(|&group| members[group] += 1);
@@ -817,6 +951,11 @@ impl Reuse {
             history,
             groups: groups.to_vec(),
             members,
+            footprints: footprints.to_vec(),
+            visit_counts: vec![1; experts.len()],
+            last_visit_read: vec![(0, 0, Vec::new()); experts.len()],
+            cross_pass_pairs: vec![Vec::new(); experts.len()],
+            intra_step: vec![HashMap::new(); experts.len()],
             pools: Pools::new(experts, records),
             time,
             step_horizon: vec![None; records.len()],
@@ -847,6 +986,136 @@ impl Reuse {
         max_depths: usize,
     ) -> Ranking {
         Ranking(Arc::new(Yielding::new(Self::with_depth(experts, groups, records, time, max_depths))))
+    }
+
+    /// [`Self::with_footprints`], shared.
+    pub fn ranking_with_footprints(
+        experts: &[usize],
+        groups: &[usize],
+        records: &[usize],
+        footprints: &[u64],
+        time: horizon::Time,
+    ) -> Ranking {
+        Self::ranking_with_footprints_and_depth(experts, groups, records, footprints, time, DEPTHS)
+    }
+
+    /// [`Self::with_footprints_and_depth`], shared.
+    pub fn ranking_with_footprints_and_depth(
+        experts: &[usize],
+        groups: &[usize],
+        records: &[usize],
+        footprints: &[u64],
+        time: horizon::Time,
+        max_depths: usize,
+    ) -> Ranking {
+        Ranking(Arc::new(Yielding::new(Self::with_footprints_and_depth(
+            experts,
+            groups,
+            records,
+            footprints,
+            time,
+            max_depths,
+        ))))
+    }
+
+    /// The record footprint (byte size or granule count) of `layer`.
+    pub fn footprint(&self, layer: usize) -> u64 {
+        self.footprints[layer]
+    }
+
+    /// Configure each physical stack's logical visit frequency per decode step
+    /// (`>= 1`), resizing per-stack ordered visit-pair carryover trackers and
+    /// immediately reranking groups if any reads have already been logged.
+    pub fn set_visit_counts(&mut self, visit_counts: &[usize]) {
+        assert_eq!(visit_counts.len(), self.layers.len(), "each physical stack has its visit count");
+        assert!(visit_counts.iter().all(|&v| v >= 1), "every visit count must be positive");
+        if self.visit_counts == visit_counts {
+            return;
+        }
+        self.visit_counts = visit_counts.to_vec();
+        for (stack, &visits) in visit_counts.iter().enumerate() {
+            self.cross_pass_pairs[stack].resize(visits.saturating_sub(1), (0.0, 0.0));
+        }
+        if self.reads > 0 {
+            let rates = front_rates(&self.stands);
+            for layer in 0..self.layers.len() {
+                let group = self.groups[layer];
+                let (horizon, a_bar, epoch) = self.horizon_of(group, Tier::COMPUTE, Reader::Move);
+                let calibration = &self.layers[layer];
+                let footprint = self.footprints[layer];
+                let visits = self.visit_counts[layer];
+                self.ranks[layer] = (0..calibration.experts())
+                    .map(|expert| {
+                        let expected = expected_for_visits(calibration, expert, &rates, horizon, a_bar, epoch, visits, None)
+                            .with_same_step(self.same_step(layer, expert), horizon, a_bar)
+                            .normalized(footprint);
+                        Rank::new(expected, calibration.last_read(expert))
+                    })
+                    .collect();
+                self.dirty[layer] = true;
+            }
+            self.finish_batch();
+        }
+    }
+
+    /// Logical visit frequency per decode step for physical stack `layer`.
+    pub fn visit_count(&self, layer: usize) -> usize {
+        self.visit_counts[layer]
+    }
+
+    /// Empirical ordered-visit-pair carryover probability for `stack`'s
+    /// transition `from_ord -> from_ord + 1` (e.g. `0` for `Pass 1 -> Pass 2`,
+    /// `1` for `Pass 2 -> Pass 3`), or `None` before any transition has been
+    /// observed.
+    pub fn cross_pass_rate(&self, stack: usize, from_ord: usize) -> Option<f64> {
+        let &(hits, seen) = self.cross_pass_pairs.get(stack)?.get(from_ord)?;
+        (seen > 0.0).then(|| (hits / seen).clamp(0.0, 1.0))
+    }
+
+    /// Register intra-step cross-pass foresight for `(stack, expert)` in
+    /// `step` targeting `dest_visit` with calibrated probability `p` of reuse
+    /// at that subsequent visit within the same step, preventing self-eviction
+    /// between visits.
+    pub fn set_intra_step(&mut self, stack: usize, expert: usize, step: Step, dest_visit: usize, p: f64) {
+        assert!(p.is_finite() && (0.0..=1.0).contains(&p), "invalid cross-pass probability {p}");
+        if p == 0.0 || self.layers[stack].latest_step().is_some_and(|latest| step <= latest) {
+            return;
+        }
+        let entry = self.intra_step[stack].entry(expert).or_insert((step, dest_visit, p));
+        if (step, dest_visit) > (entry.0, entry.1) || ((step, dest_visit) == (entry.0, entry.1) && p > entry.2) {
+            *entry = (step, dest_visit, p);
+        }
+    }
+
+    /// Clear expired intra-step cross-pass foresight for `stack` through
+    /// `(through_step, through_visit)` once that visit has passed.
+    pub fn clear_intra_step(&mut self, stack: usize, through_step: Step, through_visit: usize) {
+        if !self.intra_step[stack].is_empty() {
+            self.intra_step[stack].retain(|_, &mut (step, dest_visit, _)| (step, dest_visit) > (through_step, through_visit));
+        }
+    }
+
+    /// Expire intra-step cross-pass foresight across all stacks for any step
+    /// where `expired(step)` holds (e.g. ended or aborted steps).
+    pub fn expire_intra_step(&mut self, mut expired: impl FnMut(Step) -> bool) {
+        for map in &mut self.intra_step {
+            if !map.is_empty() {
+                map.retain(|_, &mut (step, _, _)| !expired(step));
+            }
+        }
+    }
+
+    /// Active intra-step cross-pass probability for `(stack, expert)`, or 0.0
+    /// if none or if its step has already been logged/passed.
+    fn same_step(&self, stack: usize, expert: usize) -> f64 {
+        if self.intra_step[stack].is_empty() {
+            return 0.0;
+        }
+        let latest = self.layers[stack].latest_step();
+        self.intra_step[stack]
+            .get(&expert)
+            .filter(|&&(step, _, _)| latest.is_none_or(|l| step > l))
+            .map_or(0.0, |&(_, _, p)| p)
     }
 
     /// The ranking `ranking` holds now, held ahead of its feed.
@@ -958,6 +1227,35 @@ impl Reuse {
         let choices = usize::try_from(read.choices).expect("choices fits usize");
         match kind.evidence() {
             Evidence::Decode => {
+                // Observe ordered visit-pair carryover (`Pass 1 -> Pass 2`,
+                // `Pass 2 -> Pass 3`) for shared physical stacks when
+                // successive visits of the same decode step are logged.
+                if self.visit_counts[layer] > 1 {
+                    let (prev_step, prev_ord, ref prev_experts) = self.last_visit_read[layer];
+                    if prev_step == read.sequence && !prev_experts.is_empty() {
+                        let pair_idx = prev_ord;
+                        if let Some(pair) = self.cross_pass_pairs[layer].get_mut(pair_idx) {
+                            let (mut i, mut j, mut hits) = (0usize, 0usize, 0usize);
+                            while i < prev_experts.len() && j < read.experts.len() {
+                                match prev_experts[i].cmp(&read.experts[j]) {
+                                    std::cmp::Ordering::Equal => {
+                                        hits += 1;
+                                        i += 1;
+                                        j += 1;
+                                    }
+                                    std::cmp::Ordering::Less => i += 1,
+                                    std::cmp::Ordering::Greater => j += 1,
+                                }
+                            }
+                            const DECAY: f64 = 0.95;
+                            pair.0 = pair.0 * DECAY + hits as f64;
+                            pair.1 = pair.1 * DECAY + prev_experts.len() as f64;
+                        }
+                        self.last_visit_read[layer] = (read.sequence, prev_ord + 1, read.experts.clone());
+                    } else if read.sequence > prev_step {
+                        self.last_visit_read[layer] = (read.sequence, 0, read.experts.clone());
+                    }
+                }
                 let active = rows.as_deref().map_or(choices, |r| r.choices);
                 if active > 0 {
                     self.layers[layer].set_active(active);
@@ -997,12 +1295,21 @@ impl Reuse {
                 }
             }
         }
+        // Prune any intra-step credits from steps at or before `read.sequence`
+        // so stale credits from aborted or un-cleared steps never leak.
+        if !self.intra_step[layer].is_empty() {
+            self.intra_step[layer].retain(|_, &mut (step, _, _)| step > read.sequence);
+        }
         // Release time lock already happened above; safe to read stands now.
         let rates = front_rates(&self.stands);
         let calibration = &self.layers[layer];
+        let footprint = self.footprints[layer];
+        let visits = self.visit_counts[layer];
         let ranks: Vec<Rank> = (0..calibration.experts())
             .map(|expert| {
-                let expected = expected_for(calibration, expert, &rates, horizon, a_bar, epoch, None);
+                let expected = expected_for_visits(calibration, expert, &rates, horizon, a_bar, epoch, visits, None)
+                    .with_same_step(self.same_step(layer, expert), horizon, a_bar)
+                    .normalized(footprint);
                 Rank::new(expected, calibration.last_read(expert))
             })
             .collect();
@@ -1024,12 +1331,21 @@ impl Reuse {
     }
 
     /// Record that `step`'s front row `first_fall` (1-based, `1..DEPTHS`) was
-    /// the first guessed row to fall at `layer`: counts its `fell` table
-    /// against the outcomes following `step` (design §3.4).
+    /// the first guessed row to fall at physical stack `layer`: counts its
+    /// `fell` table against the outcomes following `step` (design §3.4).
     pub fn fell(&mut self, layer: usize, step: Step, first_fall: usize) {
         let group = self.groups[layer];
         let epoch = self.time.lock().group_epoch(group);
         self.layers[layer].record_fell(step, first_fall, epoch);
+    }
+
+    /// Record that `step`'s front row `first_fall` fell across every physical
+    /// stack tracked by this ranking (safe for looped models where visit count
+    /// exceeds physical stack count).
+    pub fn fell_all(&mut self, step: Step, first_fall: usize) {
+        for stack in 0..self.layers.len() {
+            self.fell(stack, step, first_fall);
+        }
     }
 
     /// Rebuild `self.order[group]` and `self.top` once for every dirty layer
@@ -1291,7 +1607,8 @@ impl Reuse {
         let (horizon, a_bar, epoch) = self.horizon_of(group, tier, reader);
         let rates = front_rates(&self.stands);
         let override_lead = read.and_then(|read| self.lead_of(layer, read.step)).map(|lead| (lead, 1.0));
-        expected_for(&self.layers[layer], expert, &rates, horizon, a_bar, epoch, override_lead)
+        expected_for_visits(&self.layers[layer], expert, &rates, horizon, a_bar, epoch, self.visit_counts[layer], override_lead)
+            .with_same_step(self.same_step(layer, expert), horizon, a_bar)
     }
 
     /// [`Self::expected`] at `tier`'s move `τ` (`Reader::Move`: admission is
@@ -1304,23 +1621,25 @@ impl Reuse {
         let (horizon, a_bar, epoch) = self.horizon_of(group, tier, Reader::Move);
         let rates = front_rates(&self.stands);
         let override_lead = self.lead_of(layer, lead).map(|g| (g, p));
-        expected_for(&self.layers[layer], expert, &rates, horizon, a_bar, epoch, override_lead)
+        expected_for_visits(&self.layers[layer], expert, &rates, horizon, a_bar, epoch, self.visit_counts[layer], override_lead)
+            .with_same_step(self.same_step(layer, expert), horizon, a_bar)
     }
 
     /// `layer`'s `expert`'s rank ([`Rank`]) at `tier`'s `τ` for `reader`,
     /// certainly used at a read the log has yet to bring (`read`: a
-    /// landing's step, or a running prompt group's), and its last read.
+    /// landing's step, or a running prompt group's), and its last read,
+    /// normalized by `layer`'s record footprint (hits-per-byte).
     pub fn rank(&self, layer: usize, expert: usize, tier: Tier, reader: Reader, read: Option<Unlogged>) -> Rank {
-        let expected = self.expected(layer, expert, tier, reader, read);
+        let expected = self.expected(layer, expert, tier, reader, read).normalized(self.footprints[layer]);
         let last = self.layers[layer].last_read(expert).max(read.map(|read| read.step));
         Rank::new(expected, last)
     }
 
     /// A candidate's rank from its expectation ([`Self::expected_with`]),
-    /// beside its last read: what a victim test compares with the victim's
-    /// [`Self::rank`].
+    /// normalized by `layer`'s record footprint, beside its last read: what a
+    /// victim test compares with the victim's [`Self::rank`].
     pub fn rank_of(&self, layer: usize, expert: usize, expected: Expected) -> Rank {
-        Rank::new(expected, self.layers[layer].last_read(expert))
+        Rank::new(expected.normalized(self.footprints[layer]), self.layers[layer].last_read(expert))
     }
 
     /// Maximum weight of the current prompt's empirical routing rate vs prior
@@ -1364,6 +1683,8 @@ impl Reuse {
             return Vec::new();
         }
         let group = self.groups[layer];
+        let footprint = self.footprints[layer];
+        let visits = self.visit_counts[layer];
         let calibration = &self.layers[layer];
         let (horizon, a_bar, epoch) = self.horizon_of(group, Tier::COMPUTE, Reader::Move);
         if calibration.has_stale_decode_pool() {
@@ -1376,7 +1697,7 @@ impl Reuse {
                     let prompt_rate = if total > 0.0 { (active * f64::from(count) / total).min(1.0) } else { 0.0 };
                     let prior_rate = calibration.history_prob(expert, epoch);
                     let p_inf = (w * prompt_rate + (1.0 - w) * prior_rate).clamp(0.0, 1.0);
-                    let expected = expected_from([p_inf; DEPTHS], p_inf, horizon, a_bar, None);
+                    let expected = expected_from([p_inf; DEPTHS], p_inf, horizon, a_bar, None).scaled(visits).normalized(footprint);
                     let last = calibration.last_read(expert).max(Some(last));
                     Rank::new(expected, last)
                 })
@@ -1388,7 +1709,7 @@ impl Reuse {
             .zip(probs_all)
             .map(|(&(expert, _, last), probs)| {
                 let p_inf = calibration.history_prob(expert, epoch);
-                let expected = expected_from(probs, p_inf, horizon, a_bar, None);
+                let expected = expected_from(probs, p_inf, horizon, a_bar, None).scaled(visits).normalized(footprint);
                 let last = calibration.last_read(expert).max(Some(last));
                 Rank::new(expected, last)
             })
@@ -1416,8 +1737,10 @@ impl Reuse {
         last: Option<Step>,
     ) -> Rank {
         let calibration = &self.layers[owner];
+        let footprint = self.footprints[owner];
+        let visits = self.visit_counts[owner];
         if !calibration.has_stale_decode_pool() {
-            return Rank::new(ranker.expected(owner, expert, None), last);
+            return Rank::new(ranker.expected(owner, expert, None).normalized(footprint), last);
         }
         let w = Self::prompt_seed_weight(routed_total, self.layers[seed_layer].active() as f64);
         let prior_rate = calibration.history_prob(expert, ranker.epoch);
@@ -1437,7 +1760,7 @@ impl Reuse {
         } else {
             ((1.0 - w) * prior_rate).clamp(0.0, 1.0)
         };
-        let expected = expected_from([p_inf; DEPTHS], p_inf, ranker.horizon, ranker.a_bar, None);
+        let expected = expected_from([p_inf; DEPTHS], p_inf, ranker.horizon, ranker.a_bar, None).scaled(visits).normalized(footprint);
         Rank::new(expected, last)
     }
 
@@ -2218,6 +2541,143 @@ pub(super) mod tests {
         assert_eq!(reuse.history.rate(0, 3), Some(0.0));
         assert_eq!(reuse.last(0, 2), None);
         assert_eq!(reuse.last(0, 3), None);
+    }
+
+    /// Heterogeneous record sizes (e.g., 1-granule NVFP4 vs 2-granule MXFP8)
+    /// sharing a pooled cache rank eviction by hits-per-byte: an NVFP4 expert
+    /// used 75% of steps in 1 granule must outrank an MXFP8 expert used 90% of
+    /// steps in 2 granules (0.75/1 > 0.90/2), even though raw expected uses are
+    /// higher for MXFP8.
+    #[test]
+    fn heterogeneous_footprints_rank_eviction_by_hits_per_byte() {
+        let time = time_for(&[8]);
+        let footprints = [1u64, 2u64]; // stack 0 = 1 granule (NVFP4), stack 1 = 2 granules (MXFP8)
+        let mut reuse = Reuse::with_footprints(&[8, 8], &[0, 0], &[8], &footprints, time.clone());
+        // Stack 0 expert 0 used 75% of steps; stack 1 expert 0 used 90% of steps.
+        // End on step 41 where both choose expert 0 so calibration has full history
+        // and lead-1 evidence for both stacks.
+        for step in 1..=41 {
+            register_front(&time, step);
+            let s0 = if step % 4 != 0 { vec![0] } else { vec![(step as usize % 7) + 1] };
+            let s1 = if step % 10 != 0 { vec![0] } else { vec![(step as usize % 7) + 1] };
+            reuse.read(&RoutedRead { sequence: step, layer: 0, experts: s0, choices: 1 }, None, Evidence::Decode);
+            reuse.read(&RoutedRead { sequence: step, layer: 1, experts: s1, choices: 1 }, None, Evidence::Decode);
+            time.lock().moved(0, Tier::COMPUTE);
+        }
+        let exp0 = reuse.expected(0, 0, Tier::COMPUTE, Reader::Move, None);
+        let exp1 = reuse.expected(1, 0, Tier::COMPUTE, Reader::Move, None);
+        assert!(exp0.uses() > 0.0, "NVFP4 expected uses must be positive");
+        assert!(exp1.uses() > exp0.uses(), "raw expected uses of MXFP8 ({}) > NVFP4 ({})", exp1.uses(), exp0.uses());
+        let rank0 = reuse.rank(0, 0, Tier::COMPUTE, Reader::Move, None);
+        let rank1 = reuse.rank(1, 0, Tier::COMPUTE, Reader::Move, None);
+        assert!(
+            rank0 > rank1,
+            "NVFP4 hits-per-granule ({:?}) must outrank MXFP8 hits-per-granule ({:?})",
+            rank0,
+            rank1
+        );
+    }
+
+    /// Intra-step cross-pass foresight boosts an active expert of a shared
+    /// physical stack before its subsequent visit in the same step, preventing
+    /// self-eviction by intermediate layers, and clears cleanly once the later
+    /// visit passes.
+    #[test]
+    fn intra_step_cross_pass_foresight_protects_active_experts() {
+        let time = time_for(&[4]);
+        let mut reuse = Reuse::new(&[8, 8], &[0, 0], &[4], time.clone());
+        for step in 1..=10 {
+            register_front(&time, step);
+            reuse.read(&RoutedRead { sequence: step, layer: 0, experts: vec![0], choices: 1 }, None, Evidence::Decode);
+            reuse.read(&RoutedRead { sequence: step, layer: 1, experts: vec![0], choices: 1 }, None, Evidence::Decode);
+            time.lock().moved(0, Tier::COMPUTE);
+        }
+        let base_rank = reuse.rank(0, 3, Tier::COMPUTE, Reader::Move, None);
+        let peer_rank = reuse.rank(1, 3, Tier::COMPUTE, Reader::Move, None);
+        assert_eq!(base_rank, peer_rank);
+
+        reuse.set_intra_step(0, 3, 11, 2, 0.85);
+        let boosted_rank = reuse.rank(0, 3, Tier::COMPUTE, Reader::Move, None);
+        assert!(boosted_rank > peer_rank, "cross-pass foresight must boost active expert rank");
+
+        // Clearing an earlier visit (visit 1 < dest_visit 2) preserves the credit.
+        reuse.clear_intra_step(0, 11, 1);
+        assert_eq!(reuse.rank(0, 3, Tier::COMPUTE, Reader::Move, None), boosted_rank);
+
+        // Clearing at dest_visit 2 consumes the credit cleanly.
+        reuse.clear_intra_step(0, 11, 2);
+        let cleared_rank = reuse.rank(0, 3, Tier::COMPUTE, Reader::Move, None);
+        assert_eq!(cleared_rank, base_rank, "clearing after dest_visit restores baseline rank");
+
+        // Stale credit from an aborted step whose last alias never ran expires
+        // both via `expire_intra_step` and automatically once a later step logs.
+        reuse.set_intra_step(0, 3, 12, 4, 0.9);
+        assert!(reuse.rank(0, 3, Tier::COMPUTE, Reader::Move, None) > base_rank);
+        reuse.expire_intra_step(|s| s == 12);
+        assert_eq!(reuse.rank(0, 3, Tier::COMPUTE, Reader::Move, None), base_rank);
+
+        reuse.set_intra_step(0, 3, 12, 4, 0.9);
+        register_front(&time, 13);
+        reuse.read(&RoutedRead { sequence: 13, layer: 0, experts: vec![0], choices: 1 }, None, Evidence::Decode);
+        assert_eq!(
+            reuse.same_step(0, 3),
+            0.0,
+            "stale intra_step credit from skipped step 12 must not leak after step 13 logs"
+        );
+    }
+
+    /// Visit-frequency weighting scales expected uses by each physical stack's
+    /// logical visits per decode step: a 3x-visited looped stack with 40%
+    /// per-visit reuse earns 1.2 uses/step and outranks a 1x-visited entry
+    /// stack with 80% per-visit reuse (0.8 uses/step) at equal footprint.
+    #[test]
+    fn visit_frequency_weights_pooled_demand_proportionally() {
+        let time = time_for(&[8]);
+        let mut reuse = Reuse::new(&[8, 8], &[0, 0], &[8], time.clone());
+        reuse.set_visit_counts(&[1, 3]);
+        for step in 1..=40 {
+            register_front(&time, step);
+            // Stack 0 (1x): expert 0 used 80% of steps.
+            let s0 = if step % 5 != 0 { vec![0] } else { vec![(step as usize % 7) + 1] };
+            reuse.read(&RoutedRead { sequence: step, layer: 0, experts: s0, choices: 1 }, None, Evidence::Decode);
+            // Stack 1 (3x): expert 0 used 40% of visits (still 1.2 uses/step > 0.8).
+            for visit_ord in 0..3usize {
+                let tick = (step as usize - 1) * 3 + visit_ord;
+                let s1 = if tick % 5 < 2 { vec![0] } else { vec![(tick % 7) + 1] };
+                reuse.read(&RoutedRead { sequence: step, layer: 1, experts: s1, choices: 1 }, None, Evidence::Decode);
+            }
+            time.lock().moved(0, Tier::COMPUTE);
+        }
+        let rank_entry = reuse.rank(0, 0, Tier::COMPUTE, Reader::Move, None);
+        let rank_looped = reuse.rank(1, 0, Tier::COMPUTE, Reader::Move, None);
+        assert!(
+            rank_looped > rank_entry,
+            "3x-visited looped core ({rank_looped:?}) must outrank 1x entry stack ({rank_entry:?})"
+        );
+    }
+
+    /// Ordered visit-pair learning tracks `Pass 1 -> Pass 2` and `Pass 2 -> Pass 3`
+    /// carryover rates independently for a 3x-visited physical stack.
+    #[test]
+    fn ordered_visit_pairs_learn_distinct_carryover_rates() {
+        let time = time_for(&[8]);
+        let mut reuse = Reuse::new(&[8], &[0], &[8], time.clone());
+        reuse.set_visit_counts(&[3]);
+        assert_eq!(reuse.cross_pass_rate(0, 0), None);
+        assert_eq!(reuse.cross_pass_rate(0, 1), None);
+        for step in 1..=20 {
+            register_front(&time, step);
+            // Pass 1 -> Pass 2: always repeats expert 0 (100% carry).
+            // Pass 2 -> Pass 3: switches from expert 0 to expert 1 (0% carry).
+            reuse.read(&RoutedRead { sequence: step, layer: 0, experts: vec![0], choices: 1 }, None, Evidence::Decode);
+            reuse.read(&RoutedRead { sequence: step, layer: 0, experts: vec![0], choices: 1 }, None, Evidence::Decode);
+            reuse.read(&RoutedRead { sequence: step, layer: 0, experts: vec![1], choices: 1 }, None, Evidence::Decode);
+            time.lock().moved(0, Tier::COMPUTE);
+        }
+        let p12 = reuse.cross_pass_rate(0, 0).expect("Pass 1 -> Pass 2 rate learned");
+        let p23 = reuse.cross_pass_rate(0, 1).expect("Pass 2 -> Pass 3 rate learned");
+        assert!(p12 > 0.95, "Pass 1 -> Pass 2 should learn ~1.0 carry rate, got {p12}");
+        assert!(p23 < 0.05, "Pass 2 -> Pass 3 should learn ~0.0 carry rate, got {p23}");
     }
 
     /// Under `Form::Verify` with `ā = 5.4`, `τ = 65` (`h_steps ≈ 12.0 < DEPTHS`),

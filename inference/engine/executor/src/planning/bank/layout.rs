@@ -930,12 +930,13 @@ impl ExpertBankPlan {
             .iter()
             .enumerate()
             .map(|(index, layer)| {
+                let is_rep = index == self.stack_representative(layer.physical_stack);
                 Ok(LayerAllocations {
                     expert_scales: layer
                         .resident
                         .as_ref()
-                        .map(|_, plan| plan.scale.clone().map(BankAllocation::Imported)),
-                    tier: self.tiered().then(|| words(index, BankPart::TierMap)).transpose()?,
+                        .map(|_, plan| is_rep.then(|| plan.scale.clone().map(BankAllocation::Imported)).flatten()),
+                    tier: (self.tiered() && is_rep).then(|| words(index, BankPart::TierMap)).transpose()?,
                     file: words(index, BankPart::FileTable)?,
                     scratch: {
                         let (element, extents) = shape(index, BankPart::ScratchTable)?;

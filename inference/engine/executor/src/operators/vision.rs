@@ -32,6 +32,9 @@ pub enum VisionEntry {
     Position,
     /// The decoder's sandwich-norm tail (`post_norm_residual`).
     PostNormResidual,
+    /// F32 residual add (`stream_join` with `SN = 1, IN = 0`), used after
+    /// LayerScale (`ls1` / `ls2`).
+    ResidualAdd,
 }
 
 /// One specialization of a vision entry: its element bindings and the static
@@ -155,6 +158,10 @@ pub enum VisionNormKind {
     Rms {
         weight: Option<WeightRole>,
     },
+    /// Identity pass-through: gathers/concatenates and casts F32 rows to `Y`
+    /// without normalization (used when a vision merger concatenates cells with
+    /// neither a tower post-norm nor a projection norm, e.g. Inkling 2).
+    Identity,
 }
 
 impl VisionNormKind {
@@ -162,18 +169,29 @@ impl VisionNormKind {
         match self {
             Self::Layer { weight, .. } => Some(weight),
             Self::Rms { weight } => weight,
+            Self::Identity => None,
         }
     }
 
     pub fn bias(self) -> Option<WeightRole> {
         match self {
             Self::Layer { bias, .. } => Some(bias),
-            Self::Rms { .. } => None,
+            Self::Rms { .. } | Self::Identity => None,
         }
     }
 
     pub fn centered(self) -> bool {
         matches!(self, Self::Layer { .. })
+    }
+
+    /// `vision_norm`'s `centered` scalar argument: `1` for LayerNorm, `0` for
+    /// RMSNorm, `-1` for identity cast/concatenation pass-through.
+    pub fn centered_code(self) -> i32 {
+        match self {
+            Self::Layer { .. } => 1,
+            Self::Rms { .. } => 0,
+            Self::Identity => -1,
+        }
     }
 }
 
@@ -236,7 +254,8 @@ pub enum VisionOperands<R = f32> {
     },
     Pool {
         source: VisionValue,
-        standard: Option<(WeightRole, WeightRole)>,
+        rows: VisionRows,
+        standard: Option<(Option<WeightRole>, WeightRole)>,
         weight: R,
         scale: R,
     },
@@ -256,6 +275,10 @@ pub enum VisionOperands<R = f32> {
         projected: VisionValue,
         norm: WeightRole,
         epsilon: R,
+    },
+    ResidualAdd {
+        residual: VisionValue,
+        branch: VisionValue,
     },
 }
 
@@ -308,14 +331,17 @@ impl<R> Numbers<R> for VisionOperands<R> {
                 }
             }
             Self::GatedConvolution { value, gate, kernel } => VisionOperands::GatedConvolution { value, gate, kernel },
-            Self::Pool { source, standard, weight, scale } => {
+            Self::Pool { source, rows, standard, weight, scale } => {
                 let weight = f(weight);
-                VisionOperands::Pool { source, standard, weight, scale: f(scale) }
+                VisionOperands::Pool { source, rows, standard, weight, scale: f(scale) }
             }
             Self::Position { source, table } => VisionOperands::Position { source, table },
             Self::Registers { source, table } => VisionOperands::Registers { source, table },
             Self::PostNormResidual { residual, projected, norm, epsilon } => {
                 VisionOperands::PostNormResidual { residual, projected, norm, epsilon: f(epsilon) }
+            }
+            Self::ResidualAdd { residual, branch } => {
+                VisionOperands::ResidualAdd { residual, branch }
             }
         }
     }
@@ -341,11 +367,13 @@ impl<R> VisionOperands<R> {
                 query_norm.iter().chain(key_norm).copied().collect()
             }
             Self::GatedConvolution { kernel, .. } => vec![*kernel],
-            Self::Pool { standard, .. } => {
-                standard.iter().flat_map(|&(bias, scale)| [bias, scale]).collect()
-            }
+            Self::Pool { standard, .. } => standard
+                .iter()
+                .flat_map(|&(bias, scale)| bias.into_iter().chain(std::iter::once(scale)))
+                .collect(),
             Self::Position { table, .. } | Self::Registers { table, .. } => vec![*table],
             Self::PostNormResidual { norm, .. } => vec![*norm],
+            Self::ResidualAdd { .. } => Vec::new(),
         }
     }
 
@@ -520,6 +548,48 @@ impl Builder<'_> {
         ))
     }
 
+    /// Gather/concatenate `members` F32 rows of width `width` and cast directly
+    /// to `output` without normalization.
+    #[allow(clippy::too_many_arguments)]
+    fn identity_cast(
+        &mut self,
+        source: VisionValue,
+        rows: VisionRows,
+        members: u64,
+        width: u64,
+        output: Element,
+        gathered: bool,
+        interleave: bool,
+    ) -> Result<VisionValue, PlanError> {
+        let elements = vec![
+            ("NWE", self.element(None)?),
+            ("NBE", self.element(None)?),
+            ("Y", output),
+        ];
+        let statics = vec![
+            ("G", members),
+            ("H", width),
+            ("NW", 0),
+            ("NB", 0),
+            ("NO", u64::from(gathered)),
+        ];
+        Ok(self.push(
+            VisionEntry::Norm,
+            elements,
+            statics,
+            members * width,
+            VisionOperands::Norm {
+                source,
+                rows,
+                kind: VisionNormKind::Identity,
+                gathered,
+                epsilon: 0.0,
+                interleave,
+                activation: None,
+            },
+        ))
+    }
+
     /// `linear` over `x` (`inputs` wide), its input clamped first when it
     /// is clippable, then its `epilogue`.
     #[allow(clippy::too_many_arguments)]
@@ -636,6 +706,41 @@ impl Builder<'_> {
                 projected,
                 norm: norm_role,
                 epsilon: *epsilon as f32,
+            },
+        ))
+    }
+
+    /// `residual + gamma ⊙ projected` (LayerScale residual add in F32).
+    fn layer_scale_residual(
+        &mut self,
+        residual: VisionValue,
+        projected: VisionValue,
+        width: u64,
+        gamma: WeightRole,
+    ) -> Result<VisionValue, PlanError> {
+        let elements = vec![("SB", Element::f32()), ("SS", self.element(Some(gamma))?)];
+        let statics = vec![("G", 1), ("H", width), ("NS", 1)];
+        let scaled = self.push(
+            VisionEntry::Pool,
+            elements,
+            statics,
+            width,
+            VisionOperands::Pool {
+                source: projected,
+                rows: VisionRows::Patches,
+                standard: Some((None, gamma)),
+                weight: 1.0,
+                scale: 1.0,
+            },
+        );
+        Ok(self.push(
+            VisionEntry::ResidualAdd,
+            Vec::new(),
+            vec![("H", width), ("SN", 1), ("IN", 0)],
+            width,
+            VisionOperands::ResidualAdd {
+                residual,
+                branch: scaled,
             },
         ))
     }
@@ -878,8 +983,8 @@ impl Builder<'_> {
                 VisionLinearSite::ConvolutionOutput,
             ),
         };
-        let h = match &block.operator_post_norm {
-            None => self.linear(
+        let h = match (&block.operator_post_norm, &block.ls1) {
+            (None, None) => self.linear(
                 mixed,
                 patches,
                 inner,
@@ -889,7 +994,25 @@ impl Builder<'_> {
                 f32e,
                 Epilogue { tail: LinearTail::Residual(h), limit: None },
             )?,
-            Some(norm) => {
+            (None, Some(_)) => {
+                let projected = self.linear(
+                    mixed,
+                    patches,
+                    inner,
+                    output,
+                    scope,
+                    site,
+                    f32e,
+                    Epilogue::default(),
+                )?;
+                self.layer_scale_residual(
+                    h,
+                    projected,
+                    hidden,
+                    role(scope, VisionWeight::OperatorLayerScale),
+                )?
+            }
+            (Some(norm), None) => {
                 let projected = self.linear(
                     mixed,
                     patches,
@@ -909,6 +1032,11 @@ impl Builder<'_> {
                     VisionNormSite::OperatorOutput,
                 )?
             }
+            (Some(_), Some(_)) => {
+                return Err(unsupported(
+                    "vision block with both post-norm and LayerScale",
+                ));
+            }
         };
         let feedforward = &block.feedforward;
         let intermediate = feedforward.intermediate();
@@ -926,8 +1054,8 @@ impl Builder<'_> {
             None,
         )?;
         let up = self.feed_forward_up(normalized, patches, hidden, feedforward, scope)?;
-        Ok(match &block.feedforward_post_norm {
-            None => self.linear(
+        Ok(match (&block.feedforward_post_norm, &block.ls2) {
+            (None, None) => self.linear(
                 up,
                 patches,
                 intermediate,
@@ -937,7 +1065,25 @@ impl Builder<'_> {
                 f32e,
                 Epilogue { tail: LinearTail::Residual(h), limit: None },
             )?,
-            Some(norm) => {
+            (None, Some(_)) => {
+                let projected = self.linear(
+                    up,
+                    patches,
+                    intermediate,
+                    &feedforward.down,
+                    scope,
+                    VisionLinearSite::Down,
+                    f32e,
+                    Epilogue::default(),
+                )?;
+                self.layer_scale_residual(
+                    h,
+                    projected,
+                    hidden,
+                    role(scope, VisionWeight::FeedForwardLayerScale),
+                )?
+            }
+            (Some(norm), None) => {
                 let projected = self.linear(
                     up,
                     patches,
@@ -956,6 +1102,11 @@ impl Builder<'_> {
                     scope,
                     VisionNormSite::FeedForwardOutput,
                 )?
+            }
+            (Some(_), Some(_)) => {
+                return Err(unsupported(
+                    "vision block with both post-norm and LayerScale",
+                ));
             }
         })
     }
@@ -990,15 +1141,14 @@ pub(crate) fn vision_program(
             positions,
             norm,
             registers: register_table,
+            register_positions,
         } => {
             // Register rows enter the stem as zero pixels with no position
-            // blend and receive their table rows after it: exact only for a
-            // stem without a bias (which would reach them) or a norm (which
-            // would precede their rows).
-            if register_table.is_some() && (bias.is_some() || norm.is_some()) {
-                return Err(unsupported(
-                    "vision register rows with a patch bias or stem norm",
-                ));
+            // blend and receive their table rows (and optional register
+            // position embeddings) before any stem norm: exact only for a stem
+            // without a patch bias (which would reach the zero register rows).
+            if register_table.is_some() && bias.is_some() {
+                return Err(unsupported("vision register rows with a patch bias"));
             }
             let frame = role(WeightScope::VisionPatch(0), VisionWeight::PatchFrame);
             let next_frame = match frames.len() {
@@ -1022,7 +1172,7 @@ pub(crate) fn vision_program(
                 ("NB", u64::from(bias.is_some())),
                 ("NT", u64::from(table.is_some())),
             ];
-            let h = b.push(
+            let mut h = b.push(
                 VisionEntry::PatchStem,
                 elements,
                 statics,
@@ -1034,7 +1184,29 @@ pub(crate) fn vision_program(
                     table,
                 },
             );
-            let h = match norm {
+            if register_table.is_some() {
+                let table = role(vision, VisionWeight::Registers);
+                let elements = vec![("PE", b.element(Some(table))?)];
+                h = b.push(
+                    VisionEntry::Position,
+                    elements,
+                    vec![("H", hidden)],
+                    hidden,
+                    VisionOperands::Registers { source: h, table },
+                );
+            }
+            if register_positions.is_some() {
+                let table = role(vision, VisionWeight::RegisterPosition);
+                let elements = vec![("PE", b.element(Some(table))?)];
+                h = b.push(
+                    VisionEntry::Position,
+                    elements,
+                    vec![("H", hidden)],
+                    hidden,
+                    VisionOperands::Registers { source: h, table },
+                );
+            }
+            match norm {
                 None => h,
                 Some(norm) => b.norm(
                     h,
@@ -1049,20 +1221,6 @@ pub(crate) fn vision_program(
                     false,
                     None,
                 )?,
-            };
-            match register_table {
-                None => h,
-                Some(_) => {
-                    let table = role(vision, VisionWeight::Registers);
-                    let elements = vec![("PE", b.element(Some(table))?)];
-                    b.push(
-                        VisionEntry::Position,
-                        elements,
-                        vec![("H", hidden)],
-                        hidden,
-                        VisionOperands::Registers { source: h, table },
-                    )
-                }
             }
         }
         VisionStem::NormalizedPatch {
@@ -1251,6 +1409,15 @@ pub(crate) fn vision_program(
                     interleave,
                     None,
                 )?,
+                (None, None) => b.identity_cast(
+                    patch_rows(h),
+                    VisionRows::Cells,
+                    cell_rows,
+                    hidden,
+                    activation,
+                    windows,
+                    interleave,
+                )?,
                 _ => {
                     return Err(unsupported(
                         "vision merger norms around a cell concatenation",
@@ -1289,7 +1456,8 @@ pub(crate) fn vision_program(
                 hidden,
                 VisionOperands::Pool {
                     source: patch_rows(h),
-                    standard,
+                    rows: VisionRows::Cells,
+                    standard: standard.map(|(bias, scale)| (Some(bias), scale)),
                     weight: (1.0 / cell_rows as f64) as f32,
                     scale: scale as f32,
                 },

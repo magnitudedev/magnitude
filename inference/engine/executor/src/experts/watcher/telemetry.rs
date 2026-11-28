@@ -158,6 +158,7 @@ pub struct ExpertCosts {
     pub slots: usize,
     pub records: Vec<usize>,
     pub layer_groups: Vec<usize>,
+    pub layer_stacks: Vec<usize>,
     pub experts: usize,
     /// What the CPU site's answered requests took since the load: the
     /// misses it served (the rest of the tier's misses the device read over
@@ -1085,6 +1086,7 @@ impl GroupFacts {
 /// words each.
 struct Routing {
     maps: Vec<(usize, crate::experts::map::MapView)>,
+    stacks: Vec<usize>,
     records: Vec<Words>,
     words: RegionWords,
     reads: Mutex<GroupReadWords>,
@@ -2376,7 +2378,11 @@ impl Telemetry {
         let shadows = Mutex::new(None);
         let shadows_needed = AtomicBool::new(false);
         let shadow_state = Mutex::new(ShadowState::default());
-        let stack = Stack::new(ranking.clone(), layers.len(), extents.widest);
+        let stack = Stack::with_stacks(
+            ranking.clone(),
+            layers.iter().map(|layer| layer.stack).collect(),
+            extents.widest,
+        );
         Self {
             keys: super::routes::KeyRecords::of(layers, extents.words, extents.selected),
             routes: extents.recording.then(|| super::routes::RouteRecorder::of(layers, extents.words, extents.selected)),
@@ -2384,6 +2390,7 @@ impl Telemetry {
             ranking,
             routing: Routing {
                 maps: layers.iter().map(|layer| (layer.group, layer.map.clone())).collect(),
+                stacks: layers.iter().map(|layer| layer.stack).collect(),
                 records: layers.iter().map(|layer| layer.routing.clone()).collect(),
                 words: extents.words,
                 selected: extents.selected,
@@ -2719,6 +2726,7 @@ impl Telemetry {
             slots: self.slots(),
             records: recorded.records.clone(),
             layer_groups: self.routing.maps.iter().map(|(group, _)| *group).collect(),
+            layer_stacks: self.routing.stacks.clone(),
             experts: self.routing.experts.iter().copied().max().unwrap_or(0),
             site,
         }
@@ -3577,7 +3585,7 @@ impl Telemetry {
             Source::Ahead(_) => {
                 costs.front.reads += 1;
             }
-            Source::Token => {}
+            Source::Token | Source::CrossPass => {}
             Source::Exact => unreachable!("no read ahead is an exact request's"),
         }
     }
@@ -3633,9 +3641,7 @@ impl Telemetry {
         if !fallen.is_empty() {
             let mut reuse = crate::experts::reuse::Reuse::of(&self.ranking);
             for (step, first_fall) in fallen {
-                for layer in 0..self.routing.experts.len() {
-                    reuse.fell(layer, step, first_fall);
-                }
+                reuse.fell_all(step, first_fall);
             }
         }
     }

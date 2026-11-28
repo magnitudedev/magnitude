@@ -249,10 +249,14 @@ impl SiteShape {
 /// that choice for the site and its references.
 #[inline(always)]
 pub(crate) fn gated(function: i32, limit: Option<GluLimit>) -> impl Fn(f32, f32) -> f32 + Copy {
-    let limit = functions::glu_limit(GluLimit::word(limit));
+    let effective_function = match limit {
+        Some(GluLimit::Softcap { .. }) => functions::SITU,
+        _ => function,
+    };
+    let limit = functions::glu_limit(crate::operators::glu_limit_word(limit));
     move |gate, up| match limit {
-        None => functions::glu::<F32>(function, gate, up),
-        Some(limit) => functions::clamped_glu::<F32>(function, limit, gate, up),
+        None => functions::glu::<F32>(effective_function, gate, up),
+        Some(limit) => functions::clamped_glu::<F32>(effective_function, limit, gate, up),
     }
 }
 
@@ -2232,3 +2236,36 @@ fn wait_site_ready(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod situ_precision_tests {
+    use super::*;
+
+    #[test]
+    fn situ_cap_cpu_and_gpu_share_one_bf16_rne_precision_contract() {
+        // Non-BF16-exact caps:
+        // - 1.003_f32 (0x3f80_624e) rounds-to-nearest-even to BF16 0x3f80 (1.0)
+        // - 1.005_f32 (0x3f80_a3d7) rounds-to-nearest-even to BF16 0x3f81 (1.0078125),
+        //   NOT truncated to 1.0.
+        let gate_cap = 1.003_f64;
+        let up_cap = 1.005_f64;
+        let word = magnitude_kernels::situ_limit_word(gate_cap as f32, up_cap as f32);
+        let unpacked_gate = f32::from_bits((word as u32) & 0xFFFF_0000);
+        let unpacked_up = f32::from_bits(((word as u32) & 0x0000_FFFF) << 16);
+        assert_eq!(unpacked_gate, 1.0_f32, "1.003 RNE -> 1.0 in BF16");
+        assert_eq!(unpacked_up, 1.007_812_5_f32, "1.005 RNE -> 1.0078125 in BF16 (not truncated 1.0)");
+
+        let limit = Some(GluLimit::softcap(gate_cap, up_cap).expect("valid softcap"));
+        let cpu_site = gated(functions::SILU, limit);
+        let gpu_word = functions::glu_limit(crate::operators::glu_limit_word(limit)).expect("non-zero SITU word");
+        for &(g, u) in &[(-2.5_f32, 1.7_f32), (0.0, 0.0), (1.25, -0.75), (4.0, 3.0)] {
+            let site_out = cpu_site(g, u);
+            let kernel_out = functions::clamped_glu::<F32>(functions::SITU, gpu_word, g, u);
+            assert_eq!(
+                site_out.to_bits(),
+                kernel_out.to_bits(),
+                "CPU site and GPU kernel SITU must agree bit-for-bit at ({g}, {u})"
+            );
+        }
+    }
+}

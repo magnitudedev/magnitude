@@ -1,0 +1,283 @@
+# Block Attention Residuals (Block AttnRes) and Cross-Pass Message Controllers
+# for Inkling 2 (Small, Mini, Varloop).
+#
+# All residual sources and mixed outputs stay F32 (avoiding correlated error
+# accumulation across loop passes).
+
+# Depth-wise softmax attention over S F32 residual sources `[S, M, H]` using Q
+# F32 query vectors `[Q, H]`:
+#   inv[s]   = rsqrt(mean_h(sources[s, m, h]^2) + epsilon)
+#   logit[s] = (dot(queries[q], sources[s, m]) * inv[s]) * scale
+#   w        = softmax_s(logit)
+#   coeff[s] = normalize_values != 0 ? w[s] * inv[s] : w[s]
+#   out[q, m, h] = sum_s coeff[s] * sources[s, m, h]
+# Computes keys, softmax weights, and weighted sum without materializing
+# normalized source copies.
+fn block_attn_res_mix[S, M, H, Q](sources: &tensor[S, M, H] f32,
+    queries: &tensor[Q, H] f32, epsilon: f32, scale: f32,
+    normalize_values: i32) -> tensor[Q, M, H] f32
+    where S >= 1 and S <= 64 and Q >= 1:
+    let mut result = tensor[Q, M, H] f32
+    parallel for q in 0..Q:
+        parallel for row in 0..M:
+            let mut inv = tensor[S] f32
+            let mut logits = tensor[S] f32
+            let mut maximum = -inf
+            for s in 0..S:
+                let mut sq = f32(0.0)
+                let mut dot = f32(0.0)
+                for h in 0..H:
+                    let v = sources[s, row, h]
+                    sq = fma(v, v, sq)
+                    dot = fma(queries[q, h], v, dot)
+                let r = rsqrt(sq / f32(H) + epsilon)
+                inv[s] = r
+                let l = dot * r * scale
+                logits[s] = l
+                maximum = max(maximum, l)
+            let mut total = f32(0.0)
+            let mut weights = tensor[S] f32
+            for s in 0..S:
+                let e = exp(logits[s] - maximum)
+                weights[s] = e
+                total = total + e
+            let mut coeff = tensor[S] f32
+            for s in 0..S:
+                let w = weights[s] / total
+                if normalize_values != 0:
+                    coeff[s] = w * inv[s]
+                else:
+                    coeff[s] = w
+            for h in 0..H:
+                let mut acc = f32(0.0)
+                for s in 0..S:
+                    acc = fma(coeff[s], sources[s, row, h], acc)
+                result[q, row, h] = acc
+    return result
+
+native block_attn_res_mix for metal from "metal/block_attn_res_mix.metal":
+    launch block_attn_res_mix:
+        threadgroups (M, Q, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (S * 17 * 4)
+
+native block_attn_res_mix for cuda from "cuda/block_attn_res_mix.cu":
+    launch block_attn_res_mix:
+        threadgroups (M, Q, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (S * 17 * 4)
+
+native block_attn_res_mix for vulkan from "vulkan/block_attn_res_mix.comp":
+    launch block_attn_res_mix:
+        threadgroups (M, Q, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes ((64 * 2 + 32) * 4)
+
+native block_attn_res_mix for cpu from "cpu/block_attn_res_mix.rs":
+    launch block_attn_res_mix:
+        threadgroups (M * Q, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (S * 8)
+
+# Unweighted RMSNorm and concatenation of two F32 streams `[M, H]` into
+# `[M, 2 * H] A`: `[RMS(a, eps) || RMS(b, eps)]`, feeding a standard dense
+# projection `W_down` for a cross-pass `MessageController`.
+fn rms_concat[M, H](a: &tensor[M, H] f32, b: &tensor[M, H] f32,
+    epsilon: f32) -> tensor[M, 2 * H] A:
+    let mut result = tensor[M, 2 * H] A
+    parallel for row in 0..M:
+        let mut sq_a = f32(0.0)
+        let mut sq_b = f32(0.0)
+        for h in 0..H:
+            let va = a[row, h]
+            let vb = b[row, h]
+            sq_a = fma(va, va, sq_a)
+            sq_b = fma(vb, vb, sq_b)
+        let inv_a = rsqrt(sq_a / f32(H) + epsilon)
+        let inv_b = rsqrt(sq_b / f32(H) + epsilon)
+        for h in 0..H:
+            result[row, h] = a[row, h] * inv_a
+            result[row, H + h] = b[row, h] * inv_b
+    return result
+
+native rms_concat for metal from "metal/rms_concat.metal":
+    launch rms_concat:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native rms_concat for cuda from "cuda/rms_concat.cu":
+    launch rms_concat:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native rms_concat for vulkan from "vulkan/rms_concat.comp":
+    launch rms_concat:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (128)
+
+native rms_concat for cpu from "cpu/rms_concat.rs":
+    launch rms_concat:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+
+# Cross-pass MessageController elementwise gate:
+#   out = (1 - tanh(forget)) * dest + tanh(gain) * msg
+# using stable `tanh(x) = 2 / (1 + exp(-2x)) - 1`, all in F32.
+fn message_gate_mix[M, H](dest: &tensor[M, H] f32, msg: &tensor[M, H] f32,
+    gain: &tensor[M, H] f32, forget: &tensor[M, H] f32) -> tensor[M, H] f32:
+    let mut result = tensor[M, H] f32
+    parallel for row in 0..M:
+        parallel for h in 0..H:
+            let f = forget[row, h]
+            let g = gain[row, h]
+            let tf = 2.0 / (1.0 + exp(-2.0 * f)) - 1.0
+            let tg = 2.0 / (1.0 + exp(-2.0 * g)) - 1.0
+            result[row, h] = (1.0 - tf) * dest[row, h] + tg * msg[row, h]
+    return result
+
+native message_gate_mix for metal from "metal/message_gate_mix.metal":
+    launch message_gate_mix:
+        threadgroups (ceil_div(M * H, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native message_gate_mix for cuda from "cuda/message_gate_mix.cu":
+    launch message_gate_mix:
+        threadgroups (ceil_div(M * H, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native message_gate_mix for vulkan from "vulkan/message_gate_mix.comp":
+    launch message_gate_mix:
+        threadgroups (ceil_div(H, 256), min(M, 65535), 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native message_gate_mix for cpu from "cpu/message_gate_mix.rs":
+    launch message_gate_mix:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+
+# Cross-pass MessageController elementwise gate fused with RMSNorm:
+#   y[m, h]   = (1 - tanh(forget[m, h])) * dest[m, h] + tanh(gain[m, h]) * msg[m, h]
+#   inv[m]    = rsqrt(mean_h(y[m, h]^2) + epsilon)
+#   out[m, h] = A((y[m, h] * inv[m]) * norm[h])
+# Eliminates the F32 round-trip and separate `readout_features_rows` launch when
+# the gated stream feeds straight into an `InputNorm`.
+fn message_gate_mix_norm[M, H](dest: &tensor[M, H] f32, msg: &tensor[M, H] f32,
+    gain: &tensor[M, H] f32, forget: &tensor[M, H] f32,
+    norm: &tensor[H] NW, epsilon: f32) -> tensor[M, H] A
+    where H >= 1:
+    let mut result = tensor[M, H] A
+    parallel for row in 0..M:
+        let mut y = tensor[H] f32
+        let mut sq = f32(0.0)
+        for h in 0..H:
+            let f = forget[row, h]
+            let g = gain[row, h]
+            let tf = 2.0 / (1.0 + exp(-2.0 * f)) - 1.0
+            let tg = 2.0 / (1.0 + exp(-2.0 * g)) - 1.0
+            let v = (1.0 - tf) * dest[row, h] + tg * msg[row, h]
+            y[h] = v
+            sq = fma(v, v, sq)
+        let inv = rsqrt(sq / f32(H) + epsilon)
+        for h in 0..H:
+            result[row, h] = (y[h] * inv) * f32(norm[h])
+    return result
+
+native message_gate_mix_norm for metal from "metal/message_gate_mix_norm.metal":
+    where dense_bytes(A) > 0 and dense_bytes(NW) > 0
+    launch message_gate_mix_norm:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native message_gate_mix_norm for cuda from "cuda/message_gate_mix_norm.cu":
+    where dense_bytes(A) > 0 and dense_bytes(NW) > 0
+    launch message_gate_mix_norm:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native message_gate_mix_norm for vulkan from "vulkan/message_gate_mix_norm.comp":
+    where dense_bytes(A) > 0 and dense_bytes(NW) > 0
+    launch message_gate_mix_norm:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (128)
+
+native message_gate_mix_norm for cpu from "cpu/message_gate_mix_norm.rs":
+    where dense_bytes(A) > 0 and dense_bytes(NW) > 0
+    launch message_gate_mix_norm:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (H * 8)
+
+# Small-K relative-bias projection for `RelativeBias` attention, with optional
+# fused `head_l2_clip` (`threshold > 0.0`):
+#   When `threshold > 0.0`, applies optional per-head/shared channel `scale`,
+#   L2 norm clipping at `threshold` with `epsilon`, and optional position
+#   log-scaling `tau` from `coordinates[m, 0]`, rounding the clipped vector to
+#   activation element `A` before the projection so the intermediate dtype
+#   boundary is exact. When `threshold <= 0.0`, projects `r` directly.
+#   out[m, h, e] = sum_{d=0..D} r_eff[m, h, d] * weight[e, d]
+# Handles small `D` (e.g. d_rel = 16) on all backends without K % 64 alignment
+# restrictions so `BlockAttnRes` stays 100% device-resident inside sealed graphs.
+fn rel_bias_project[M, H, D, E, SC](r: &tensor[M, H, D] A,
+    weight: &tensor[E, D] W, scale: &tensor[SC, D] f32,
+    coordinates: &tensor[M, 4] i32, threshold: f32, epsilon: f32,
+    log_floor: f32, log_alpha: f32) -> tensor[M, H, E] f32
+    where D >= 1 and E >= 1 and SC >= 0 and (SC == 0 or SC == 1 or SC == H):
+    let mut result = tensor[M, H, E] f32
+    parallel for row in 0..M:
+        let mut tau = f32(1.0)
+        if threshold > 0.0 and log_alpha != 0.0:
+            let ratio = (f32(coordinates[row, 0]) + 1.0) / log_floor
+            tau = 1.0 + log_alpha * log(max(1.0, ratio))
+        parallel for head in 0..H:
+            let mut r_eff = tensor[D] A
+            if threshold > 0.0:
+                let mut sq = f32(0.0)
+                for d in 0..D:
+                    let mut v = f32(r[row, head, d])
+                    if SC > 0:
+                        v = v * scale[head % SC, d]
+                    sq = fma(v, v, sq)
+                let clip = min(1.0, threshold / (sqrt(sq) + epsilon))
+                let factor = clip * tau
+                for d in 0..D:
+                    let mut v = f32(r[row, head, d])
+                    if SC > 0:
+                        v = v * scale[head % SC, d]
+                    r_eff[d] = v * factor
+            else:
+                for d in 0..D:
+                    r_eff[d] = f32(r[row, head, d])
+            parallel for ext in 0..E:
+                let mut acc = f32(0.0)
+                for d in 0..D:
+                    acc = fma(f32(r_eff[d]), f32(weight[ext, d]), acc)
+                result[row, head, ext] = acc
+    return result
+
+native rel_bias_project for metal from "metal/rel_bias_project.metal":
+    where dense_bytes(A) > 0 and dense_bytes(W) > 0
+    launch rel_bias_project:
+        threadgroups (H, M, ceil_div(E, 32))
+        threads_per_threadgroup (32, 1, 1)
+
+native rel_bias_project for cuda from "cuda/rel_bias_project.cu":
+    where dense_bytes(A) > 0 and dense_bytes(W) > 0
+    launch rel_bias_project:
+        threadgroups (H, min(M, 65535), ceil_div(E, 32))
+        threads_per_threadgroup (32, 1, 1)
+
+native rel_bias_project for vulkan from "vulkan/rel_bias_project.comp":
+    where dense_bytes(A) > 0 and dense_bytes(W) > 0
+    launch rel_bias_project:
+        threadgroups (H, min(M, 65535), ceil_div(E, 64))
+        threads_per_threadgroup (64, 1, 1)
+        shared_bytes (384)
+
+native rel_bias_project for cpu from "cpu/rel_bias_project.rs":
+    where dense_bytes(A) > 0 and dense_bytes(W) > 0
+    launch rel_bias_project:
+        threadgroups (M * H, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (D * 8)

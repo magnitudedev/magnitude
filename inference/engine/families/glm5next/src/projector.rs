@@ -105,6 +105,7 @@ pub fn describe_projector(
         positions: None,
         norm: None,
         registers: None,
+        register_positions: None,
     };
 
     // One stored QKV projection, imported as three row ranges (preserving any companion scale).
@@ -170,6 +171,8 @@ pub fn describe_projector(
                 ),
             },
             feedforward_post_norm: None,
+            ls1: None,
+            ls2: None,
         });
     }
 

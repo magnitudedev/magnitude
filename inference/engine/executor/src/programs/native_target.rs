@@ -260,6 +260,7 @@ struct StepSubmitter<'p> {
     pending_landed: Vec<SelectedRead>,
     queued_landed: usize,
     landed: Vec<SubmittedRead>,
+    retained: Vec<Box<dyn std::any::Any + Send>>,
 }
 
 /// A scratch-served chain's release of its load's expert bank beside its
@@ -314,6 +315,7 @@ impl<'p> StepSubmitter<'p> {
             pending_landed: Vec::new(),
             queued_landed: 0,
             landed: Vec::new(),
+            retained: Vec::new(),
         }
     }
 
@@ -375,6 +377,7 @@ impl<'p> StepSubmitter<'p> {
                 stored_reads: Vec::new(),
                 landed_reads: Vec::new(),
                 expert_step: banked.map(|(_, step)| step),
+                retained: Vec::new(),
                 decode_reactor_banks: Vec::new(),
                 prompt_routes: None,
             };
@@ -388,6 +391,7 @@ impl<'p> StepSubmitter<'p> {
         let (_, last) = steps.last_mut();
         last.stored_reads = self.reads;
         last.landed_reads = self.landed;
+        last.retained = self.retained;
         last.decode_reactor_banks = self.decode_reactor_banks;
         last.prompt_routes = self.prompt_routes;
         steps
@@ -775,6 +779,9 @@ pub struct TargetOutput {
     pub stored_reads: Vec<StoredRead>,
     /// The step of a streamed load's expert bank, until it completes.
     pub(crate) expert_step: Option<crate::experts::ExpertStep>,
+    /// Device buffers/slots retained until the step's GPU completions finish.
+    #[allow(dead_code)]
+    pub(crate) retained: Vec<Box<dyn std::any::Any + Send>>,
     pub(crate) decode_reactor_banks: Vec<(Arc<crate::experts::ExpertBank>, u64)>,
     /// Host-visible per-layer prompt routes captured during a grouped prefill
     /// chain, extracted and emitted to `NameLedger` in [`TargetOutput::complete`].
@@ -984,6 +991,7 @@ struct DeviceStep {
     landed_reads: Vec<SubmittedRead>,
     stored_reads: Vec<StoredRead>,
     expert_step: Option<crate::experts::ExpertStep>,
+    retained: Vec<Box<dyn std::any::Any + Send>>,
     decode_reactor_banks: Vec<(Arc<crate::experts::ExpertBank>, u64)>,
     prompt_routes: Option<PromptRoutesCapture>,
 }
@@ -1313,6 +1321,10 @@ impl NativeTargetProgram {
 
     pub(crate) fn constant_bytes(&self) -> Result<u64, &'static str> {
         self.graphs.constant_bytes()
+    }
+
+    pub(crate) fn runtime_scratch_bytes(&self) -> u64 {
+        self.graphs.runtime_scratch_bytes()
     }
 
     pub(crate) fn group_bytes(&self, places: usize) -> Result<u64, String> {
@@ -2056,6 +2068,9 @@ impl NativeTargetProgram {
         serving: Option<&crate::experts::ChainServing>,
         submitter: &mut StepSubmitter,
     ) -> Result<Branded<'b, QueuedRuns>, SubmitError> {
+        if let Some(bar) = &self.graphs.block_attn_res {
+            return self.queue_block_attn_res_runs(bar, steps, serving, submitter);
+        }
         let scratch = serving.is_some_and(crate::experts::ChainServing::scratch);
         let group = self.graphs.group(steps.len()).map_err(invalid)?;
         if let Some(bank) = &self.graphs.bank {
@@ -2153,6 +2168,498 @@ impl NativeTargetProgram {
                 sequences: submitter.completions.len(),
             })
         })
+    }
+
+    /// Execute a chain of `ResidualForm::BlockAttention` (Inkling 2) launches
+    /// through `BoundBlockAttnRes` in layer-by-layer wavefront order and feed
+    /// each launch's final `[M, hidden]` F32 hidden state directly into
+    /// `self.graph_readout`.
+    fn queue_block_attn_res_runs<'b>(
+        &self,
+        bar: &super::native_target_graph::block_attn_res::BoundBlockAttnRes,
+        steps: Branded<'b, &'b mut (ValidatedTargetLaunch, Option<(Arc<crate::experts::ExpertBank>, crate::experts::ExpertStep)>)>,
+        serving: Option<&crate::experts::ChainServing>,
+        submitter: &mut StepSubmitter,
+    ) -> Result<Branded<'b, QueuedRuns>, SubmitError> {
+        use super::native_target_graph::block_attn_res::BlockAttnResLayerState;
+        use super::native_target_graph::block_attn_res_graph::{
+            BarChainStep, queue_sealed_chain,
+        };
+        let group = self.graphs.group(steps.len()).map_err(invalid)?;
+
+        struct StepSetup<'l> {
+            first_commit: Instant,
+            bank_run: Option<BankRun>,
+            batch: TargetBatchUpload<'l>,
+            state: RowState<'l>,
+            graph_workspace: &'l mut TargetGraphWorkspaceLease,
+            workspace: &'l mut NativeGraphWorkspaceLease,
+            output: &'l mut NativeGraphOutputLease,
+            rows: u64,
+            slots: usize,
+            spans: u64,
+            entry_hidden: Tensor,
+            overlay_bufs: Vec<(usize, usize, Vec<f32>)>,
+            layers: Vec<BlockAttnResLayerState>,
+            visible_per_layer: Vec<Vec<i32>>,
+            fresh_vec: Vec<i32>,
+            dest_vec: Vec<i32>,
+            conv_segments: Vec<i32>,
+            host_guesses: Vec<[i32; 2]>,
+            banked_info: Option<(Arc<crate::experts::ExpertBank>, u64, u32, Option<usize>)>,
+            region: ChainRegion,
+            raw_taps_tensor: Option<Tensor>,
+        }
+
+        let mut place = 0usize;
+        let mut setups = steps.try_map(|(launch, banked)| {
+            let first_commit = Instant::now();
+            let bank_run = banked.as_ref().map(|(bank, step)| BankRun {
+                bank: bank.clone(),
+                sequence: step.sequence(),
+                front: step.front(),
+                sampled: step.samples(),
+                serving: serving.expect("a banked chain has its serving state").clone(),
+            });
+            let banked_info = banked.as_ref().map(|(bank, step)| {
+                (bank.clone(), step.sequence(), step.front(), step.group_reads())
+            });
+            let (core, graph_workspace, graph_output, workspace, output) =
+                launch.submission_parts_mut();
+            let batch = core.batch().upload();
+            let state = RowState(core);
+            let rows = u64::try_from(batch.class.rows())
+                .map_err(|_| invalid("row class exceeds u64"))?;
+            let slots = batch.segments.len().saturating_sub(1);
+            let region = ChainRegion {
+                place,
+                start: self.graphs.prepared.region_start(place),
+                group: group.clone(),
+            };
+            place += 1;
+
+            // Queue the shared `PreparedTargetEntryGraph` so resident/stored
+            // embedding tables (`directory`, `EntryNotice`, `LandedReadPorts`),
+            // `TargetTokens::Selected`, and `EntryNorm::Rms` all run through
+            // the single authoritative entry path.
+            let source = match state.tokens() {
+                TargetTokens::Host(..) => EntryTokens::Uploaded,
+                TargetTokens::Selected { .. } => EntryTokens::Selected,
+            };
+            let (entry, entry_bound) = self.graphs.entry(rows, source).map_err(invalid)?;
+            let entry_hidden = {
+                let mut active = graph_workspace
+                    .slot_mut()
+                    .activate(&entry.plan)
+                    .map_err(device)?;
+                let mut bindings = entry_bound.bindings();
+                match state.tokens() {
+                    TargetTokens::Host(..) => {
+                        let mapped = self
+                            .graphs
+                            .embedding
+                            .indices(batch.tokens)
+                            .map_err(invalid)?;
+                        active
+                            .write_input(&entry.tokens, &token_rows(&mapped))
+                            .map_err(device)?;
+                    }
+                    TargetTokens::Selected { selected, .. } => bindings
+                        .set(&self.unallocating(), &entry.tokens, selected.tensor())
+                        .map_err(device)?,
+                }
+                if let Some(kept) = &entry.kept_guesses {
+                    active
+                        .write_input(&kept.uploaded, &i32_bytes(state.host_guesses().as_flattened()))
+                        .map_err(device)?;
+                    bindings
+                        .set(
+                            &self.unallocating(),
+                            &kept.rows,
+                            &self.kept_guess_rows(&region, rows)?,
+                        )
+                        .map_err(device)?;
+                }
+                if let Some(ports) = &entry.notice {
+                    let step = self
+                        .graphs
+                        .notice
+                        .as_ref()
+                        .ok_or_else(|| invalid("an entry notice without a selection notice"))?
+                        .next(rows)
+                        .map_err(invalid)?;
+                    bindings
+                        .set(&self.unallocating(), &ports.tokens, &step.tokens)
+                        .map_err(device)?;
+                    bindings
+                        .set_timeline(ports.signal, &step.timeline, step.value)
+                        .map_err(device)?;
+                }
+                if let Some(ports) = &entry.landed {
+                    let read = ports
+                        .queue(&self.graphs.embedding, &self.unallocating(), &mut bindings)
+                        .map_err(invalid)?;
+                    submitter.lands(read);
+                }
+                let active_out = graph_output
+                    .activate(&entry.plan)
+                    .map_err(SubmitError::Invariant)?
+                    .run_outputs(|outputs| {
+                        let ready = active.attach(bindings, outputs).map_err(device)?;
+                        submitter.queue(ready, |_| {})
+                    })?;
+                graph_output.hold(active_out);
+                graph_output
+                    .active_outputs()
+                    .and_then(|o| o.exported(&entry.hidden))
+                    .ok_or_else(|| invalid("BlockAttnRes entry hidden was not exported"))?
+            };
+
+            let cond_sources = self.conditioning_sources(&state, &batch)?;
+            for (source, start, end) in cond_sources {
+                let overlay = self.overlay((end - start) as u64)?;
+                let destination = entry_hidden
+                    .slice_leading(start as u64, end as u64)
+                    .map_err(device)?;
+                let mut bindings = overlay.plan.bindings();
+                bindings
+                    .set(&self.unallocating(), &overlay.source, &source)
+                    .map_err(device)?;
+                bindings
+                    .set(&self.unallocating(), &overlay.destination, &destination)
+                    .map_err(device)?;
+                let mut slot = overlay
+                    .plan
+                    .new_slot(&self.unallocating())
+                    .map_err(device)?;
+                let ready = slot
+                    .attach(
+                        bindings,
+                        overlay
+                            .plan
+                            .new_outputs(&self.unallocating())
+                            .map_err(device)?,
+                    )
+                    .map_err(device)?;
+                submitter.queue(ready, |_| {})?;
+            }
+            let overlay_bufs: Vec<(usize, usize, Vec<f32>)> = Vec::new();
+
+            let arenas = state.recurrent_arenas().unwrap_or(&[]);
+            let mut arena_cursor = 0usize;
+            let mut layers = Vec::with_capacity(self.geometry.blocks.len());
+            let mut visible_per_layer = Vec::with_capacity(self.geometry.blocks.len());
+            let mut spans = 1u64;
+            let mut fresh_vec = Vec::new();
+            let mut dest_vec = Vec::new();
+
+            for (b_idx, block) in self.geometry.blocks.iter().enumerate() {
+                let layer_ref = LayerRef::Target(b_idx as u32);
+                let (read_idx, planes) = state.history(layer_ref)?;
+                if planes.len() < 2 {
+                    return Err(invalid("BlockAttnRes attention expects dense K and V planes"));
+                }
+                let history_key = planes[0].clone();
+                let history_value = planes[1].clone();
+                let domain = state
+                    .0
+                    .store()
+                    .history_source(layer_ref)
+                    .ok_or_else(|| invalid("BlockAttnRes layer has no history domain"))?
+                    .domain;
+                let slab_rows = state.0.store().history_slab_rows(domain) as u32;
+
+                let hist_read = batch
+                    .histories
+                    .get(read_idx)
+                    .ok_or_else(|| invalid("missing history read for BlockAttnRes layer"))?;
+                let vis_i32: Vec<i32> = hist_read
+                    .visible
+                    .iter()
+                    .flatten()
+                    .flatten()
+                    .copied()
+                    .collect();
+                let layer_spans = (vis_i32.len() as u64) / (2 * rows).max(1);
+                if b_idx == 0 {
+                    spans = layer_spans.max(1);
+                    fresh_vec = hist_read.fresh.as_flattened().to_vec();
+                    dest_vec = hist_read.destinations.to_vec();
+                }
+                visible_per_layer.push(vis_i32);
+
+                let mut take_conv = |present: bool| -> Result<Option<Tensor>, SubmitError> {
+                    if !present {
+                        return Ok(None);
+                    }
+                    let t = arenas
+                        .get(arena_cursor)
+                        .ok_or_else(|| invalid("missing ConvWindow arena for BlockAttnRes"))?
+                        .clone();
+                    arena_cursor += 1;
+                    Ok(Some(t))
+                };
+                let (has_kc, has_vc) = match block.sublayers.first().map(|s| &s.op) {
+                    Some(magnitude_family_contracts::Operator::Attention(a)) => {
+                        match &a.history[0].rows {
+                            magnitude_family_contracts::HistoryRows::Own(
+                                magnitude_family_contracts::RowProducer::Projected(p),
+                            ) => (p.key_conv.is_some(), p.value_conv.is_some()),
+                            _ => (false, false),
+                        }
+                    }
+                    _ => (false, false),
+                };
+                let has_attn_pc = block
+                    .sublayers
+                    .first()
+                    .is_some_and(|s| s.post_conv.is_some());
+                let has_ffn_pc = block
+                    .sublayers
+                    .get(1)
+                    .is_some_and(|s| s.post_conv.is_some());
+
+                let key_conv_window = take_conv(has_kc)?;
+                let value_conv_window = take_conv(has_vc)?;
+                let attn_post_conv_window = take_conv(has_attn_pc)?;
+                let ffn_post_conv_window = take_conv(has_ffn_pc)?;
+                let slab_banks = state.0.store().bank_slab_banks().max(1) as u32;
+
+                layers.push(BlockAttnResLayerState {
+                    history_key,
+                    history_value,
+                    key_conv_window,
+                    value_conv_window,
+                    attn_post_conv_window,
+                    ffn_post_conv_window,
+                    slab_rows,
+                    slab_banks,
+                });
+            }
+
+            let conv_segments: Vec<i32> = batch.segments[..=slots]
+                .iter()
+                .flat_map(|p| *p)
+                .collect();
+            let host_guesses = match state.tokens() {
+                TargetTokens::Host(..) => state.host_guesses(),
+                TargetTokens::Selected { .. } => vec![[0; 2]; batch.class.rows()],
+            };
+
+            let raw_taps_tensor: Option<Tensor> = if !bar.prepared.tap_points.is_empty() {
+                region
+                    .group
+                    .taps
+                    .as_ref()
+                    .map(|tap_buf| region.rows(tap_buf, rows))
+                    .transpose()?
+            } else {
+                None
+            };
+
+            Ok(StepSetup {
+                first_commit,
+                bank_run,
+                batch,
+                state,
+                graph_workspace,
+                workspace,
+                output,
+                rows,
+                slots,
+                spans,
+                entry_hidden,
+                overlay_bufs,
+                layers,
+                visible_per_layer,
+                fresh_vec,
+                dest_vec,
+                conv_segments,
+                host_guesses,
+                banked_info,
+                region,
+                raw_taps_tensor,
+            })
+        })?;
+
+        // Run the entire chain in strict layer-by-layer wavefront order.
+        let (exit_hiddens, bar_retained) = {
+            let mut chain_steps: Vec<BarChainStep<'_>> = setups
+                .iter_mut()
+                .map(|s| {
+                    let selected_guesses = match s.state.tokens() {
+                        TargetTokens::Selected {
+                            guesses: Some(g), ..
+                        } => Some(g.tensor()),
+                        _ => None,
+                    };
+                    let all_whole = serving.is_some_and(|sv| sv.has_homes && sv.all_whole());
+                    let bar_bank_run = s.banked_info.as_ref().map(|(bank, seq, front, gr)| {
+                        super::native_target_graph::block_attn_res::BlockAttnResBankRun {
+                            bank,
+                            sequence: *seq,
+                            front: *front,
+                            place: s.region.place,
+                            group_reads: *gr,
+                            guesses: selected_guesses,
+                            host_guesses: &s.host_guesses,
+                            all_whole,
+                        }
+                    });
+                    BarChainStep {
+                        routed_slot: s.graph_workspace.slot_mut(),
+                        layers: std::mem::take(&mut s.layers),
+                        entry_hidden: s.entry_hidden.clone(),
+                        coordinates: s.batch.coordinates.as_flattened(),
+                        media_overlays: std::mem::take(&mut s.overlay_bufs),
+                        visible_per_layer: std::mem::take(&mut s.visible_per_layer),
+                        spans: s.spans,
+                        fresh: std::mem::take(&mut s.fresh_vec),
+                        destinations: std::mem::take(&mut s.dest_vec),
+                        conv_segments: std::mem::take(&mut s.conv_segments),
+                        conv_stop: &s.batch.stop[..s.slots],
+                        conv_prev_bank: &s.batch.bank[..s.slots],
+                        conv_prev_tape: &s.batch.previous_tape[..s.slots],
+                        conv_next_bank: &s.batch.following_bank[..s.slots],
+                        tap_buf: s.raw_taps_tensor.clone(),
+                        bank_run: bar_bank_run,
+                    }
+                })
+                .collect();
+            queue_sealed_chain(
+                bar,
+                &self.geometry,
+                &mut chain_steps,
+                |action| {
+                    use super::native_target_graph::block_attn_res_graph::BarComputeAction;
+                    match action {
+                        BarComputeAction::Queue { ready, register } => {
+                            let mut reg_err: Option<String> = None;
+                            submitter
+                                .queue(ready, |outputs| {
+                                    if let Err(err) = register(outputs) {
+                                        reg_err = Some(err);
+                                    }
+                                })
+                                .map_err(|e| e.to_string())?;
+                            if let Some(err) = reg_err {
+                                return Err(err);
+                            }
+                            Ok(())
+                        }
+                        BarComputeAction::FlushFront {
+                            bank,
+                            layer,
+                            max_sequence,
+                        } => {
+                            submitter.flush().map_err(|e| e.to_string())?;
+                            if bank.tier_copy_dma()
+                                && bank.parks().kept()
+                                && bank.parks().prefill_front_visible(layer) < max_sequence
+                            {
+                                let front_done = submitter.completions.pop();
+                                submitter
+                                    .wait_completion(front_done)
+                                    .map_err(|e| e.to_string())?;
+                                bank.parks().mark_prefill_front_visible(layer, max_sequence);
+                            }
+                            Ok(())
+                        }
+                        BarComputeAction::DmaPass {
+                            bank,
+                            group,
+                            layer,
+                            place,
+                            sequence,
+                            window,
+                            ready,
+                        } => {
+                            let dma_ready = bank
+                                .transport()
+                                .take_prefill_sync(layer, sequence, window)
+                                .map_err(|e| e.to_string())?;
+                            let tracked = TrackedPrefillPass::new(
+                                bank,
+                                crate::experts::transport::PassKey {
+                                    generation: dma_ready.generation,
+                                    group,
+                                    layer,
+                                    set_start: place,
+                                    window,
+                                },
+                            );
+                            if let Some(sync) = dma_ready.sync {
+                                submitter.follow_transfer(sync).map_err(|e| e.to_string())?;
+                            }
+                            submitter.queue(ready, |_| {}).map_err(|e| e.to_string())?;
+                            submitter
+                                .flush_tracked_pass(tracked)
+                                .map_err(|e| e.to_string())?;
+                            Ok(())
+                        }
+                    }
+                },
+            )
+            .map_err(device)?
+        };
+        submitter.retained.push(bar_retained);
+
+        let mut exits = exit_hiddens.into_iter();
+        let queued = setups.try_map(|s| {
+            let exit_hidden = exits.next().expect("exit_hidden per step");
+            let mut run = TargetRun {
+                launch: RunLaunch {
+                    batch: s.batch,
+                    state: s.state,
+                    graph_workspace: s.graph_workspace,
+                    readout: (s.workspace, s.output),
+                },
+                output: 0,
+                back: None,
+                unfilled: None,
+                residual: None,
+                hidden: ResidualCarry {
+                    rows: exit_hidden,
+                    pre: None,
+                },
+                carried: None,
+                per_layer_rows: None,
+                region: s.region,
+                controls: GraphControls {
+                    histories: Vec::new(),
+                    launch: Vec::new(),
+                },
+                window: RowWindow {
+                    first: 0,
+                    rows: s.rows,
+                },
+                segments: s.spans,
+                slots: s.slots as u64,
+                notice: None,
+                recurrent_component: 0,
+                executed: self.geometry.blocks.len(),
+                first_commit: s.first_commit,
+                bank: s.bank_run,
+                tapped: s.raw_taps_tensor.is_some(),
+            };
+            let mut readout = self.graph_readout(&mut run, submitter)?;
+            if let (Some(r), Some(taps_t)) = (readout.as_mut(), s.raw_taps_tensor) {
+                if r.features.tensor().extents().last().copied() != taps_t.extents().last().copied() {
+                    r.features = crate::GraphOutputTensor::standalone(taps_t);
+                }
+            }
+            let commits = CommitSpan {
+                first: s.first_commit,
+                last: Instant::now(),
+            };
+            submitter.flush()?;
+            Ok(QueuedRuns {
+                readout,
+                commits,
+                sequences: submitter.completions.len(),
+            })
+        })?;
+        Ok(queued)
     }
 
     /// Queue a step's entry: its embedding, conditioning overlays and
@@ -3537,6 +4044,7 @@ impl TargetProgram for NativeTargetProgram {
                     landed_reads: queued.landed_reads,
                     stored_reads: queued.stored_reads,
                     expert_step: queued.expert_step,
+                    retained: queued.retained,
                     decode_reactor_banks: queued.decode_reactor_banks,
                     prompt_routes: queued.prompt_routes,
                 },

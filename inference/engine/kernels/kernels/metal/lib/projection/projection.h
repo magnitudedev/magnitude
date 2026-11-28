@@ -269,6 +269,14 @@ struct Glu {
         float gate = A::round(gate_sum);
         float up = A::round(up_sum);
 #if defined(PROJECTION_GLU_LIMIT)
+        if (function == functions::situ) {
+            const uint bits = uint(PROJECTION_GLU_LIMIT);
+            const float gate_cap = as_type<float>(bits & 0xFFFF0000u);
+            const float up_cap = as_type<float>((bits & 0x0000FFFFu) << 16u);
+            y.put(ulong(m) * stride0 + ulong(n) * stride1,
+                functions::softcap(gate_cap, gate) * functions::sigmoid(gate) * functions::softcap(up_cap, up));
+            return;
+        }
         const float limit = as_type<float>(uint(PROJECTION_GLU_LIMIT));
         gate = gate > limit ? limit : gate;
         up = up > limit ? limit : up;

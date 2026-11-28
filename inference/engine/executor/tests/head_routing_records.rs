@@ -83,6 +83,8 @@ fn routed_block(
             RowProducer::Projected(ProjectedRows {
                 key: desc(unique, &name("k"), &[WIDTH, hidden]),
                 value: ValueSource::Projected(desc(unique, &name("v"), &[WIDTH, hidden])),
+                key_conv: None,
+                value_conv: None,
                 key_norm: HeadNorm::Rms(rms(unique, &name("kn"), WIDTH)),
                 value_norm: ValueNorm::None,
                 domain: TokenDomain::Token,
@@ -95,9 +97,11 @@ fn routed_block(
             sections: vec![WIDTH / 4],
             axis_pattern: vec![0],
         },
+        relative_bias: None,
+        log_scale: None,
         scale: 1.0 / (WIDTH as f64).sqrt(),
         media_rows: MediaRowAttention::Causal,
-        sinks: None,
+        sinks: magnitude_family_contracts::AttentionSinks::None,
         output: OutputProjection::Full(desc(unique, &name("o"), &[hidden, 2 * WIDTH])),
     };
     let routed = RoutedFfn {
@@ -129,14 +133,17 @@ fn routed_block(
             Sublayer {
                 input: InputNorm::Rms(rms(unique, &name("attn_norm"), hidden)),
                 op: Operator::Attention(Box::new(attention)),
+                post_conv: None,
                 output: OutputForm::Residual,
             },
             Sublayer {
                 input: InputNorm::Rms(rms(unique, &name("ffn_norm"), hidden)),
                 op: Operator::RoutedFfn(Box::new(routed)),
+                post_conv: None,
                 output: OutputForm::Residual,
             },
         ],
+        transition: None,
     }
 }
 
@@ -189,6 +196,7 @@ fn routed_mtp_fixture() -> (ModelDefinition, PackageManifest) {
             exit: ExitForm {
                 norm: ExitNorm::Rms(rms(&mut unique, "output_norm", HIDDEN)),
                 output: desc(&mut unique, "output", &[VOCAB, HIDDEN]),
+                unpadded_vocabulary: None,
                 softcap: None,
             },
         },

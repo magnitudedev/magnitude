@@ -1201,13 +1201,16 @@ impl Recorded {
     /// each holding exactly what its allocations charged
     /// ([`Claim::fit_allocated`]). A group's class beyond one place is
     /// claimed as the group opens, never here.
-    pub fn claim_arena(&mut self, ledger: &Ledger) -> ArenaClaim {
+    pub fn claim_arena(&mut self, ledger: &Ledger, mut reserve: u64) -> ArenaClaim {
         let store = ledger.store();
         let (mut arena, rest): (Vec<Claim>, Vec<Claim>) = std::mem::take(&mut self.claims)
             .into_iter()
             .partition(|claim| claim.kind() == CommittedKind::Arena && claim.ledger().store.identity == store);
         self.claims = rest;
-        arena.iter_mut().for_each(Claim::fit_allocated);
+        for claim in &mut arena {
+            let kept = claim.fit_allocated_with_reserve(reserve);
+            reserve = reserve.saturating_sub(kept);
+        }
         ArenaClaim::of(arena)
     }
 

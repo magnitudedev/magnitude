@@ -145,6 +145,8 @@ pub fn describe_projector(
                 },
             },
             feedforward_post_norm: None,
+            ls1: None,
+            ls2: None,
         });
     }
     let merger_norm = layer_norm(
@@ -201,6 +203,7 @@ pub fn describe_projector(
             }),
             norm: None,
             registers: None,
+            register_positions: None,
         },
         window: None,
         blocks,

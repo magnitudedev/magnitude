@@ -1146,6 +1146,7 @@ mod resource_template_tests {
                         let graph = entry_graph_topology(
                             NativeGraphMetadata::new(backend),
                             &elements,
+                            None,
                             load.copies_token_rows().then_some(&[][..]),
                             load.notifies_selection(),
                             landing.as_ref().map(CheckedLandingEntries::entries),

@@ -184,6 +184,7 @@ pub fn describe_projector(
         positions: Some(positions),
         norm: None,
         registers: Some(r.tensors.bind("v.class_embd", &[registers, hidden])?),
+        register_positions: None,
     };
 
     let mut blocks = Vec::with_capacity(depth as usize);
@@ -215,6 +216,8 @@ pub fn describe_projector(
                 down: r.linear(&format!("{p}.ffn_down"), hidden, intermediate)?,
             },
             feedforward_post_norm: None,
+            ls1: None,
+            ls2: None,
         });
     }
 

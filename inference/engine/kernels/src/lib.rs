@@ -8,6 +8,31 @@
 
 include!(concat!(env!("OUT_DIR"), "/kernels.rs"));
 
+/// Pack `(gate_cap, up_cap)` into the `LB` static extent of `glu_limit` for
+/// SITU activation (`activation = 3`): top 16 bits are `gate_cap` rounded to
+/// nearest-even BF16, bottom 16 bits are `up_cap` rounded to nearest-even BF16.
+/// Both caps must be positive and finite (and remain positive and finite after
+/// BF16 rounding).
+pub fn situ_limit_word(gate_cap: f32, up_cap: f32) -> u64 {
+    fn f32_to_bf16_rne(value: f32, name: &str) -> u64 {
+        assert!(
+            value.is_finite() && value > 0.0,
+            "{name} must be positive and finite, got {value}"
+        );
+        let bits = value.to_bits();
+        let lsb = (bits >> 16) & 1;
+        let rounded = bits.wrapping_add(0x7FFF + lsb) >> 16;
+        assert!(
+            rounded > 0 && rounded < 0x7F80,
+            "{name} {value} rounds out of positive finite BF16 range"
+        );
+        u64::from(rounded)
+    }
+    let g = f32_to_bf16_rne(gate_cap, "gate_cap");
+    let u = f32_to_bf16_rne(up_cap, "up_cap");
+    (g << 16) | u
+}
+
 /// The threadgroups of a decode landing launch (`routed_land`) as the grid
 /// word its route writes while it lands (`resolve`'s `land_groups`):
 /// streaming_words.seismic's LAND_THREADGROUPS, which every backend's

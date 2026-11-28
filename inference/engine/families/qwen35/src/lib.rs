@@ -113,6 +113,7 @@ fn block(
             Sublayer {
                 input: InputNorm::Rms(geometry.rms(weight("attn_norm.weight", &[hidden])?)),
                 op: mixer,
+                post_conv: None,
                 output: OutputForm::Residual,
             },
             Sublayer {
@@ -120,9 +121,11 @@ fn block(
                     geometry.rms(weight("post_attention_norm.weight", &[hidden])?),
                 ),
                 op: feed_forward,
+                post_conv: None,
                 output: OutputForm::Residual,
             },
         ],
+        transition: None,
     })
 }
 
@@ -246,6 +249,7 @@ pub fn inspect_components(
                 norm: ExitNorm::Rms(geometry.rms(output_norm)),
                 output,
                 softcap: None,
+                unpadded_vocabulary: None,
             },
         },
         head,

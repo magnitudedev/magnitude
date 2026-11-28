@@ -7,6 +7,7 @@
 
 pub(crate) mod attention;
 pub(crate) mod block;
+pub(crate) mod block_attn_res;
 pub(crate) mod dense_ffn;
 pub(crate) mod draft;
 pub(crate) mod gated_delta;
@@ -23,12 +24,15 @@ pub(crate) mod vision;
 use crate::SublayerTail;
 use crate::error::PlanError;
 use magnitude_family_contracts::{
-    Attention, Block, BranchOutput, Decoder, DenseFfn, ExitNorm, Head, HeadBlock,
-    ExitSite, HeadChain, HeadComponent, HeadHistory, HeadInput, HeadReadout, HyperConnectionExit,
-    HyperConnectionInput, HyperConnectionWeights, InputNorm, LayerNorm, LowRankGatedSite,
-    ModelDefinition, Operator, OutputForm, ProposalReadoutPolicy,
-    ResidualForm, RmsNorm, RoutedFfn, RouterInput, Sublayer, SublayerIndex, VocabularyProjection,
-    WeightDescriptor, WeightKind, WeightRole, WeightScope,
+    Attention, Block, BlockAttentionInput, BlockAttentionNorm, BlockAttentionQueries,
+    BlockAttentionStream, BlockTransition, BranchOutput, CausalShortConv, CrossPassInput,
+    CrossPassMessage, Decoder, DenseFfn, EntryNorm, ExitNorm, ExitSite, GluLimit,
+    Head, HeadBlock, HeadChain, HeadComponent, HeadHistory, HeadInput, HeadReadout,
+    HyperConnectionExit, HyperConnectionInput, HyperConnectionWeights, InputNorm, LayerNorm,
+    LowRankGatedSite, MessageController, MessageControllerPart, ModelDefinition, Operator,
+    OutputForm, ProposalReadoutPolicy, ResidualForm, RmsNorm, RoutedFfn, RouterInput, Sublayer,
+    SublayerIndex, VisionWeight, VocabularyProjection, WeightDescriptor, WeightKind, WeightRole,
+    WeightScope,
 };
 use magnitude_family_contracts::{HistoryReads, NGramGate, ShortConv, StateSpace};
 use crate::programs::graph::GraphError;
@@ -184,16 +188,57 @@ impl<'t> SublayerInput<'t> {
     }
 }
 
+/// The static `LB` extent word for a gated expansion's `limit`: 0 for no
+/// limit, the F32 bit pattern for a hard clamp (`GluLimit::Clamp`), or the
+/// packed `(gate_cap_bf16 << 16) | up_cap_bf16` word for SITU softcapping
+/// (`GluLimit::Softcap`).
+pub(crate) fn glu_limit_word(limit: Option<GluLimit>) -> u64 {
+    match limit {
+        None => 0,
+        Some(GluLimit::Clamp(cap)) => u64::from((f64::from(cap) as f32).to_bits()),
+        Some(GluLimit::Softcap { gate_cap, up_cap }) => magnitude_kernels::situ_limit_word(
+            f64::from(gate_cap) as f32,
+            f64::from(up_cap) as f32,
+        ),
+    }
+}
+
+/// A gated expansion's `LB` static dimension and bound `glu_limit` host port,
+/// derived from one single [`glu_limit_word`] so specialization and the bound
+/// argument extent cannot diverge.
+pub(crate) struct GluLimitBinding {
+    word: u64,
+    port: seismic::WorkflowTensorView,
+}
+
+impl GluLimitBinding {
+    /// Derives both `LB` and the `[0, LB]` `glu_limit` view from `limit`,
+    /// backed by `table` (any i32 tensor of the call).
+    pub(crate) fn new(table: &seismic::WorkflowTensor, limit: Option<GluLimit>) -> Self {
+        let word = glu_limit_word(limit);
+        let port = table.slice_leading(0, 0).reshape(&[0, word]);
+        Self { word, port }
+    }
+
+    /// The `LB` dimension entry for the call's specialization/enqueue dimensions.
+    pub(crate) fn dim(&self) -> (&'static str, Dim) {
+        ("LB", Dim::from(self.word))
+    }
+
+    /// The bound `glu_limit` host port at extents `[0, LB]`.
+    pub(crate) fn port(&self) -> &seismic::WorkflowTensorView {
+        &self.port
+    }
+}
+
 /// A gated expansion's host port `glu_limit` for `limit`: no values, at
-/// extents `[0, LB]` (`GluLimit::word`, the static its kernels compile the
-/// clamp from), viewed from `table`, any i32 tensor of the call.
+/// extents `[0, LB]` (`glu_limit_word`, the static its kernels compile the
+/// clamp or softcap from), viewed from `table`, any i32 tensor of the call.
 pub(crate) fn glu_limit(
     table: &seismic::WorkflowTensor,
-    limit: Option<magnitude_family_contracts::GluLimit>,
+    limit: Option<GluLimit>,
 ) -> seismic::WorkflowTensorView {
-    table
-        .slice_leading(0, 0)
-        .reshape(&[0, magnitude_family_contracts::GluLimit::word(limit)])
+    GluLimitBinding::new(table, limit).port
 }
 
 /// How a sublayer's consumer entry forms its input row (`form_input`):
@@ -271,8 +316,11 @@ pub(crate) fn tail(
     lookup: &impl Fn(WeightKind) -> Result<Element, PlanError>,
 ) -> Result<SublayerTail, PlanError> {
     match output {
-        // A scatter is the residual output joining the streams (`Join`).
-        OutputForm::Residual | OutputForm::Scatter => Ok(SublayerTail::Residual),
+        // A scatter is the residual output joining the streams (`Join`);
+        // a block commit starts a new block-attention partial.
+        OutputForm::Residual | OutputForm::BlockCommit | OutputForm::Scatter => {
+            Ok(SublayerTail::Residual)
+        }
         OutputForm::PostNorm(_) => Ok(SublayerTail::PostNorm {
             norm: lookup(WeightKind::PostNorm)?,
             scaled: false,
@@ -284,9 +332,25 @@ pub(crate) fn tail(
     }
 }
 
+/// The logical descriptor for `decoder.exit.output`: sliced to
+/// `unpadded_vocabulary` rows when padded, otherwise the stored descriptor.
+pub(crate) fn exit_output_descriptor(
+    decoder: &Decoder,
+) -> Result<std::borrow::Cow<'_, WeightDescriptor>, PlanError> {
+    match decoder.exit.unpadded_vocabulary {
+        Some(active) if active < decoder.vocabulary => decoder
+            .exit
+            .output
+            .slice_rows(0, active)
+            .map(std::borrow::Cow::Owned)
+            .map_err(|_| PlanError::Topology("exit output cannot be sliced to unpadded vocabulary")),
+        _ => Ok(std::borrow::Cow::Borrowed(&decoder.exit.output)),
+    }
+}
+
 /// The weights of the decoder's exit norm (`WeightScope::Target`): its norm
 /// weight, or a hyper-connection exit site's weights in the order its mix
-/// consumes them.
+/// consumes them, or a block-attention exit's query and norm.
 pub(crate) fn exit_weights(decoder: &Decoder) -> Vec<(WeightRole, &WeightDescriptor)> {
     match &decoder.exit.norm {
         ExitNorm::HyperConnectionHead(exit) => {
@@ -294,6 +358,16 @@ pub(crate) fn exit_weights(decoder: &Decoder) -> Vec<(WeightRole, &WeightDescrip
             exit_site_weights(exit, WeightScope::Target, &mut weights);
             weights
         }
+        ExitNorm::BlockAttention { query, norm } => vec![
+            (
+                role(
+                    WeightScope::Target,
+                    WeightKind::BlockAttentionQuery(BlockAttentionStream::Shared),
+                ),
+                query,
+            ),
+            (role(WeightScope::Target, WeightKind::OutputNorm), &norm.weight),
+        ],
         ExitNorm::Rms(RmsNorm { weight, .. }) | ExitNorm::Layer(LayerNorm { weight, .. }) => {
             vec![(role(WeightScope::Target, WeightKind::OutputNorm), weight)]
         }
@@ -344,6 +418,7 @@ pub(crate) fn sublayer_source(input: &InputNorm) -> Result<SublayerSource<'_>, P
     match input {
         InputNorm::Rms(norm) => Ok(SublayerSource::Norm(norm)),
         InputNorm::HyperConnectionMix(input) => mix_source(input),
+        InputNorm::BlockAttention(input) => Ok(SublayerSource::BlockAttention(input)),
         _ => Err(PlanError::Unsupported("sublayer input normalization")),
     }
 }
@@ -489,6 +564,13 @@ pub(crate) fn head_weights(head: &Head) -> Result<Vec<(WeightRole, &WeightDescri
         }
         match &head_block.output_norm {
             ExitNorm::HyperConnectionHead(exit) => exit_site_weights(exit, scope, &mut weights),
+            ExitNorm::BlockAttention { query, norm } => {
+                weights.push((
+                    role(WeightKind::BlockAttentionQuery(BlockAttentionStream::Shared)),
+                    query,
+                ));
+                weights.push((role(WeightKind::OutputNorm), &norm.weight));
+            }
             ExitNorm::Rms(RmsNorm { weight, .. }) | ExitNorm::Layer(LayerNorm { weight, .. }) => {
                 weights.push((role(WeightKind::OutputNorm), weight))
             }
@@ -682,8 +764,14 @@ fn sublayer_weights<'a>(
     } else {
         operator_weights(&sublayer.op, scope, weights);
     }
+    if let Some(conv) = &sublayer.post_conv {
+        weights.push((role(scope, WeightKind::PostShortConv), &conv.weight));
+        if let Some(dynamic) = &conv.dynamic {
+            weights.push((role(scope, WeightKind::PostShortConvDynamic), &dynamic.proj));
+        }
+    }
     match &sublayer.output {
-        OutputForm::Residual | OutputForm::Scatter => {}
+        OutputForm::Residual | OutputForm::BlockCommit | OutputForm::Scatter => {}
         OutputForm::PostNorm(norm) => {
             weights.push((role(scope, WeightKind::PostNorm), &norm.weight))
         }
@@ -698,6 +786,48 @@ fn role(scope: WeightScope, kind: WeightKind) -> WeightRole {
     WeightRole { scope, kind }
 }
 
+fn push_cross_pass_weights<'a>(
+    message: &'a CrossPassMessage,
+    stream: BlockAttentionStream,
+    scope: WeightScope,
+    weights: &mut Vec<(WeightRole, &'a WeightDescriptor)>,
+) {
+    weights.push((role(scope, WeightKind::CrossPassQuery(stream)), &message.query));
+    let MessageController {
+        down, gain, forget, ..
+    } = &message.controller;
+    weights.push((
+        role(
+            scope,
+            WeightKind::MessageController {
+                stream,
+                part: MessageControllerPart::Down,
+            },
+        ),
+        down,
+    ));
+    weights.push((
+        role(
+            scope,
+            WeightKind::MessageController {
+                stream,
+                part: MessageControllerPart::Gain,
+            },
+        ),
+        gain,
+    ));
+    weights.push((
+        role(
+            scope,
+            WeightKind::MessageController {
+                stream,
+                part: MessageControllerPart::Forget,
+            },
+        ),
+        forget,
+    ));
+}
+
 fn input_weights<'a>(
     input: &'a InputNorm,
     scope: WeightScope,
@@ -709,6 +839,59 @@ fn input_weights<'a>(
             hyper_connection_weights(&input.site, scope, weights);
             if let Some(norm) = &input.norm {
                 weights.push((role(scope, WeightKind::InputNorm), &norm.weight));
+            }
+        }
+        InputNorm::BlockAttention(input) => {
+            match &input.queries {
+                BlockAttentionQueries::Partial => {}
+                BlockAttentionQueries::Single(query) => weights.push((
+                    role(scope, WeightKind::BlockAttentionQuery(BlockAttentionStream::Shared)),
+                    query,
+                )),
+                BlockAttentionQueries::SplitQkv { query, key, value } => {
+                    weights.push((
+                        role(scope, WeightKind::BlockAttentionQuery(BlockAttentionStream::Query)),
+                        query,
+                    ));
+                    weights.push((
+                        role(scope, WeightKind::BlockAttentionQuery(BlockAttentionStream::Key)),
+                        key,
+                    ));
+                    weights.push((
+                        role(scope, WeightKind::BlockAttentionQuery(BlockAttentionStream::Value)),
+                        value,
+                    ));
+                }
+            }
+            match &input.cross_pass {
+                CrossPassInput::None => {}
+                CrossPassInput::Single(message) => {
+                    push_cross_pass_weights(message, BlockAttentionStream::Shared, scope, weights);
+                }
+                CrossPassInput::SplitQkv { query, key, value } => {
+                    push_cross_pass_weights(query, BlockAttentionStream::Query, scope, weights);
+                    push_cross_pass_weights(key, BlockAttentionStream::Key, scope, weights);
+                    push_cross_pass_weights(value, BlockAttentionStream::Value, scope, weights);
+                }
+            }
+            match &input.norm {
+                BlockAttentionNorm::Shared(norm) => {
+                    weights.push((role(scope, WeightKind::InputNorm), &norm.weight));
+                }
+                BlockAttentionNorm::SplitQkv { query, key, value } => {
+                    weights.push((
+                        role(scope, WeightKind::BlockAttentionInputNorm(BlockAttentionStream::Query)),
+                        &query.weight,
+                    ));
+                    weights.push((
+                        role(scope, WeightKind::BlockAttentionInputNorm(BlockAttentionStream::Key)),
+                        &key.weight,
+                    ));
+                    weights.push((
+                        role(scope, WeightKind::BlockAttentionInputNorm(BlockAttentionStream::Value)),
+                        &value.weight,
+                    ));
+                }
             }
         }
         InputNorm::RmsUnweighted(_) | InputNorm::None => {}
@@ -814,16 +997,28 @@ pub(crate) fn is_fixed_dense_role(kind: WeightKind) -> bool {
             | WeightKind::SharedRouter
             | WeightKind::ConvolutionBase
             | WeightKind::AttentionSinks
+            | WeightKind::BlockAttentionQuery(_)
+            | WeightKind::CrossPassQuery(_)
+            | WeightKind::RelativeQueryNorm
+            | WeightKind::KeyShortConv
+            | WeightKind::ValueShortConv
+            | WeightKind::PostShortConv
+            | WeightKind::DraftContextKeyNorm
+            | WeightKind::MarkovRnnBias
+            | WeightKind::MarkovHiddenOutBias
             // `stream_mix_sinkhorn` projects and mixes in F32.
             | WeightKind::HyperConnectionFunction
             | WeightKind::HyperConnectionBase
             | WeightKind::HyperConnectionScale
-            // `vision_attention` reads its head norms in F32, and
-            // `vision_clamp` and `vision_linear` a clippable linear's bounds.
+            // `vision_attention` reads its head norms in F32, `vision_pool`
+            // reads LayerScale gammas in F32, and `vision_clamp` and
+            // `vision_linear` a clippable linear's bounds.
             | WeightKind::Vision(
-                magnitude_family_contracts::VisionWeight::QueryNorm
-                    | magnitude_family_contracts::VisionWeight::KeyNorm
-                    | magnitude_family_contracts::VisionWeight::Linear {
+                VisionWeight::QueryNorm
+                    | VisionWeight::KeyNorm
+                    | VisionWeight::OperatorLayerScale
+                    | VisionWeight::FeedForwardLayerScale
+                    | VisionWeight::Linear {
                         part: magnitude_family_contracts::LinearPart::InputMinimum
                             | magnitude_family_contracts::LinearPart::InputMaximum
                             | magnitude_family_contracts::LinearPart::OutputMinimum
@@ -834,9 +1029,33 @@ pub(crate) fn is_fixed_dense_role(kind: WeightKind) -> bool {
     ) || matches!(kind, WeightKind::Corrector(weight) if draft::corrector_reads_f32(weight))
 }
 
+/// Whether a specific bound weight descriptor is consumed as a fixed-F32
+/// tensor. Differs from [`is_fixed_dense_role`] only for polymorphic roles
+/// where static vectors are F32 and 2D projection matrices follow the
+/// activation/quantized representation (`AttentionSinks::Dynamic`).
+pub(crate) fn is_fixed_dense_weight(kind: WeightKind, descriptor: &WeightDescriptor) -> bool {
+    if kind == WeightKind::AttentionSinks {
+        return descriptor.shape.len() == 1;
+    }
+    is_fixed_dense_role(kind)
+}
+
 /// The dense element a role becomes resident in.
 pub(crate) fn resident_dtype(kind: WeightKind, activation: seismic::DType) -> seismic::DType {
     if is_fixed_dense_role(kind) {
+        seismic::DType::F32
+    } else {
+        activation
+    }
+}
+
+/// The dense element a bound weight descriptor becomes resident in.
+pub(crate) fn resident_dtype_for(
+    kind: WeightKind,
+    descriptor: &WeightDescriptor,
+    activation: seismic::DType,
+) -> seismic::DType {
+    if is_fixed_dense_weight(kind, descriptor) {
         seismic::DType::F32
     } else {
         activation
@@ -870,8 +1089,10 @@ pub(crate) enum FeedForward<'a> {
 /// normalized first (`OutputForm::PostNorm`).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PairedBlock<'a> {
+    pub transition: Option<BlockTransition>,
     pub mixer_input: SublayerSource<'a>,
     pub mixer: Mixer<'a>,
+    pub mixer_post_conv: Option<&'a CausalShortConv>,
     pub mixer_output: &'a OutputForm,
     pub feed_forward: Option<FeedForwardSublayer<'a>>,
     /// The per-layer input sublayer after the feed-forward (Gemma E2B/E4B):
@@ -883,14 +1104,15 @@ pub(crate) struct PairedBlock<'a> {
 }
 
 /// What a sublayer reads: the residual under its RMS input norm, a low-rank
-/// hyper-connection mix site's partials over the residual streams, or a
-/// Sinkhorn site's input row under the sublayer's norm (the site's weights
-/// are read by their roles, `stream_mix_sinkhorn`).
+/// hyper-connection mix site's partials over the residual streams, a Sinkhorn
+/// site's input row under the sublayer's norm, or a block-attention residual
+/// mix (with optional cross-pass bank messages) under its RMS norm(s).
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum SublayerSource<'a> {
     Norm(&'a RmsNorm),
     Mix(&'a LowRankGatedSite),
     Sinkhorn(&'a RmsNorm),
+    BlockAttention(&'a BlockAttentionInput),
 }
 
 impl SublayerSource<'_> {
@@ -899,6 +1121,7 @@ impl SublayerSource<'_> {
         match self {
             Self::Norm(norm) | Self::Sinkhorn(norm) => norm.epsilon,
             Self::Mix(mix) => mix.norm.epsilon,
+            Self::BlockAttention(input) => input.norm.epsilon(),
         }
     }
 
@@ -912,6 +1135,12 @@ impl SublayerSource<'_> {
     ) -> Result<Element, PlanError> {
         match (self, kind) {
             (Self::Mix(_), WeightKind::InputNorm) => Ok(Element::f32()),
+            (Self::BlockAttention(input), WeightKind::InputNorm) => match &input.norm {
+                BlockAttentionNorm::Shared(_) => lookup(WeightKind::InputNorm),
+                BlockAttentionNorm::SplitQkv { .. } => {
+                    lookup(WeightKind::BlockAttentionInputNorm(BlockAttentionStream::Query))
+                }
+            },
             _ => lookup(kind),
         }
     }
@@ -929,6 +1158,7 @@ impl SublayerSource<'_> {
 pub(crate) struct FeedForwardSublayer<'a> {
     pub input: Option<SublayerSource<'a>>,
     pub op: FeedForward<'a>,
+    pub post_conv: Option<&'a CausalShortConv>,
     pub output: &'a OutputForm,
 }
 
@@ -975,7 +1205,12 @@ impl Mixer<'_> {
     /// consecutive in model order.
     pub fn bank_components(&self) -> usize {
         match self {
-            Self::Attention(_) => 0,
+            Self::Attention(attention) => match attention::fresh_rows(attention) {
+                attention::FreshRows::Own(rows) => {
+                    usize::from(rows.key_conv.is_some()) + usize::from(rows.value_conv.is_some())
+                }
+                attention::FreshRows::Shared(_) => 0,
+            },
             // Window, delta or state, tape.
             Self::GatedDelta(_) | Self::StateSpace(_) => 3,
             // The window alone: its rows are the tape.
@@ -993,20 +1228,29 @@ pub(crate) fn bank_component_index(blocks: &[Block], index: usize) -> Result<usi
 }
 
 impl PairedBlock<'_> {
-    /// The state the block keeps: its mixer's history or bank, and its
-    /// n-gram input's bank.
+    /// The state the block keeps: its mixer's history or bank, plus any
+    /// causal short-convolution or n-gram bank windows.
     pub fn keeps(&self) -> BlockKeeps {
-        match (&self.mixer, &self.ngram) {
-            (Mixer::Attention(_), None) => BlockKeeps::History,
-            (Mixer::Attention(_), Some(_)) => BlockKeeps::HistoryAndBank,
-            (Mixer::GatedDelta(_) | Mixer::StateSpace(_) | Mixer::ShortConv(_), _) => BlockKeeps::Bank,
+        match (&self.mixer, self.bank_components() > 0) {
+            (Mixer::Attention(_), false) => BlockKeeps::History,
+            (Mixer::Attention(_), true) => BlockKeeps::HistoryAndBank,
+            (Mixer::GatedDelta(_) | Mixer::StateSpace(_) | Mixer::ShortConv(_), _) => {
+                BlockKeeps::Bank
+            }
         }
     }
 
     /// The components the block keeps in the state store's recurrent bank,
-    /// consecutive in model order: its mixer's, then its n-gram input's.
+    /// consecutive in model order: its mixer's, its mixer post-conv's, its
+    /// feed-forward post-conv's, then its n-gram input's.
     pub fn bank_components(&self) -> usize {
-        self.mixer.bank_components() + self.ngram.map_or(0, |ngram| ngram.bank_components())
+        self.mixer.bank_components()
+            + usize::from(self.mixer_post_conv.is_some())
+            + self
+                .feed_forward
+                .and_then(|ff| ff.post_conv)
+                .map_or(0, |_| 1)
+            + self.ngram.map_or(0, |ngram| ngram.bank_components())
     }
 
     /// The one normalization epsilon the block's kernels take.
@@ -1051,7 +1295,7 @@ impl PairedBlock<'_> {
 pub(crate) fn post_norm_epsilon(output: &OutputForm) -> Option<f64> {
     match output {
         OutputForm::PostNorm(norm) | OutputForm::ScaledPostNorm { norm, .. } => Some(norm.epsilon),
-        OutputForm::Residual | OutputForm::Scatter => None,
+        OutputForm::Residual | OutputForm::BlockCommit | OutputForm::Scatter => None,
     }
 }
 
@@ -1064,6 +1308,15 @@ pub(crate) fn admit(definition: &ModelDefinition, head: bool) -> Result<(), Plan
     }
     let decoder = &definition.decoder;
     let streams = streams::StreamsGeometry::of(decoder)?;
+    if matches!(
+        decoder.entry.norm,
+        Some(EntryNorm::Rms {
+            text_only: false,
+            ..
+        })
+    ) {
+        return Err(PlanError::Unsupported("non-text-only weighted entry norm"));
+    }
     // `embedding_rows` scales (`embedding_transform`) and normalizes text
     // rows. Media rows enter as their projector leaves them: a family whose
     // text rows are normalized at entry normalizes its media rows in its
@@ -1076,6 +1329,7 @@ pub(crate) fn admit(definition: &ModelDefinition, head: bool) -> Result<(), Plan
     // residual form).
     let exit_epsilon = match &decoder.exit.norm {
         ExitNorm::Rms(norm) => norm.epsilon,
+        ExitNorm::BlockAttention { norm, .. } => norm.epsilon,
         ExitNorm::HyperConnectionHead(exit) => match ExitMix::of(exit)? {
             // The streams' collapse is a Sinkhorn streams' entry.
             ExitMix::Mean(_) if streams.is_some_and(|streams| streams.sinkhorn().is_none()) => {
@@ -1143,6 +1397,11 @@ pub(crate) fn admit(definition: &ModelDefinition, head: bool) -> Result<(), Plan
             let expected = match block.residual {
                 ResidualForm::Single => OutputForm::Residual,
                 ResidualForm::HyperConnections(_) => OutputForm::Scatter,
+                ResidualForm::BlockAttention { .. } => {
+                    return Err(PlanError::Unsupported(
+                        "draft head over block-attention residual",
+                    ));
+                }
             };
             if [paired.mixer_output, feed_forward.output]
                 .iter()
@@ -1152,6 +1411,7 @@ pub(crate) fn admit(definition: &ModelDefinition, head: bool) -> Result<(), Plan
             }
             let output_epsilon = match &head_block.output_norm {
                 ExitNorm::Rms(output) => output.epsilon,
+                ExitNorm::BlockAttention { norm, .. } => norm.epsilon,
                 ExitNorm::HyperConnectionHead(exit) => ExitMix::of(exit)?.epsilon(),
                 _ => return Err(PlanError::Unsupported("draft head output normalization")),
             };
@@ -1411,9 +1671,14 @@ pub(crate) fn paired_block(block: &Block) -> Result<PairedBlock<'_>, PlanError> 
         }
         Some(sublayer) => (Some(per_layer::admit(sublayer)?), None),
     };
-    // The residual joins: a residual add (or a post-norm tail), or the
-    // scatter of a mix site's sublayer into the streams.
-    let joins = |output: &OutputForm| matches!(output, OutputForm::Residual | OutputForm::Scatter);
+    // The residual joins: a residual add (or block commit or post-norm tail),
+    // or the scatter of a mix site's sublayer into the streams.
+    let joins = |output: &OutputForm| {
+        matches!(
+            output,
+            OutputForm::Residual | OutputForm::BlockCommit | OutputForm::Scatter
+        )
+    };
     let mixer_input = sublayer_source(&mixer.input)?;
     let mixer_op = match &mixer.op {
         Operator::Attention(operator) => {
@@ -1461,6 +1726,7 @@ pub(crate) fn paired_block(block: &Block) -> Result<PairedBlock<'_>, PlanError> 
                         &feed_forward.input,
                         &feed_forward.output,
                     )?),
+                    post_conv: feed_forward.post_conv.as_ref(),
                     output: &feed_forward.output,
                 });
             }
@@ -1493,13 +1759,16 @@ pub(crate) fn paired_block(block: &Block) -> Result<PairedBlock<'_>, PlanError> 
             Ok(FeedForwardSublayer {
                 input: Some(input),
                 op,
+                post_conv: feed_forward.post_conv.as_ref(),
                 output: &feed_forward.output,
             })
         })
         .transpose()?;
     Ok(PairedBlock {
+        transition: block.transition,
         mixer_input,
         mixer: mixer_op,
+        mixer_post_conv: mixer.post_conv.as_ref(),
         mixer_output: &mixer.output,
         feed_forward,
         per_layer,
@@ -1546,4 +1815,41 @@ pub(crate) fn code(code: i32) -> u64 {
 /// form the graph does not branch on): guarded to fit the argument's word.
 pub(crate) fn scalar<T: ArgumentWord>(dim: &Dim, what: &str) -> Result<Argument<T>, GraphError> {
     dim.word::<T>().ok_or_else(|| format!("{what} exceeds its argument").into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use magnitude_family_contracts::GluCap;
+    use seismic::{BackendName, NativeGraphMetadata};
+
+    #[test]
+    fn glu_limit_binding_matches_specialization_and_port_for_all_variants() {
+        let mut graph = NativeGraphMetadata::new(BackendName::Metal);
+        let table = graph.port(Element::i32(), &[4, 2]).unwrap().tensor().clone();
+
+        let clamp = GluLimit::Clamp(GluCap::new(7.0).unwrap());
+        let softcap = GluLimit::Softcap {
+            gate_cap: GluCap::new(15.0).unwrap(),
+            up_cap: GluCap::new(10.0).unwrap(),
+        };
+
+        let cases = [
+            (None, 0u64),
+            (Some(clamp), u64::from(7.0f32.to_bits())),
+            (Some(softcap), magnitude_kernels::situ_limit_word(15.0, 10.0)),
+        ];
+
+        for (limit, expected_word) in cases {
+            let binding = GluLimitBinding::new(&table, limit);
+            assert_eq!(binding.word, expected_word);
+            assert_eq!(binding.dim(), ("LB", Dim::from(expected_word)));
+            let _port: &seismic::WorkflowTensorView = binding.port();
+        }
+
+        // Softcap must carry a nonzero packed word (distinct from `GluLimit::word`, which is 0).
+        let softcap_word = glu_limit_word(Some(softcap));
+        assert_ne!(softcap_word, 0);
+        assert_ne!(softcap_word, GluLimit::word(Some(softcap)));
+    }
 }

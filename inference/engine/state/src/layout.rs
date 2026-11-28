@@ -3,9 +3,10 @@ use crate::{
     LayerRef,
 };
 use magnitude_family_contracts::{
-    ActivationDType, Attention, Block, Decoder, GatedDelta, HistoryReads, HistoryRows, Indexer,
-    IndexerKeys, NGramInput, Operator, Pool, PooledRows, ProjectedRows, ResidualForm,
-    RowProducer, RowRounding, Selection, ShortConv, StateSpace, TokenDomain, ValueSource,
+    ActivationDType, Attention, AttentionSinks, Block, CausalShortConv, Decoder, GatedDelta,
+    HistoryReads, HistoryRows, Indexer, IndexerKeys, NGramInput, Operator, Pool, PooledRows,
+    ProjectedRows, ResidualForm, RowProducer, RowRounding, Selection, ShortConv, StateSpace,
+    TokenDomain, ValueSource,
 };
 use seismic::{DType, Element, SlabLayout, SlabRegion, Tensor};
 
@@ -279,7 +280,7 @@ impl ModelStateLayout {
         let mut target_history = HistoryDomains::default();
         let mut target_banks = Vec::new();
         for (index, block) in decoder.blocks.iter().enumerate() {
-            for stateful in block_state(block)? {
+            for stateful in block_state(block, decoder.hidden)? {
                 match stateful {
                     Stateful::Attention(attention) => target_history.attention(
                         layer(index)?,
@@ -293,6 +294,9 @@ impl ModelStateLayout {
                     }
                     Stateful::ShortConv(convolution) => {
                         target_banks.push(short_convolution_bank(convolution)?)
+                    }
+                    Stateful::CausalShortConv { conv, channels } => {
+                        target_banks.push(causal_short_conv_bank(conv, channels)?)
                     }
                     Stateful::StateSpace(space) => {
                         target_banks.extend(state_space_bank(space, activation)?)
@@ -309,7 +313,7 @@ impl ModelStateLayout {
 
         let mut head_history = HistoryDomains::default();
         for (index, block) in drafter.iter().enumerate() {
-            match block_state(block)?.as_slice() {
+            match block_state(block, decoder.hidden)?.as_slice() {
                 // Drafter history stays dense whatever the target codec: the
                 // drafters' attention reads dense planes only. A drafter
                 // keeps every source's own state, its indexer's too.
@@ -574,45 +578,89 @@ enum Stateful<'a> {
     Attention(&'a Attention),
     GatedDelta(&'a GatedDelta),
     ShortConv(&'a ShortConv),
+    CausalShortConv {
+        conv: &'a CausalShortConv,
+        channels: u64,
+    },
     StateSpace(&'a StateSpace),
     NGram(&'a NGramInput),
 }
 
 /// The state a block keeps, in sublayer order: at most one mixer's (an
-/// attention history or a recurrent bank), and the n-gram input's bank.
-fn block_state(block: &Block) -> Result<Vec<Stateful<'_>>, String> {
+/// attention history or a recurrent bank), any causal short-convolution
+/// windows on keys/values/sublayer outputs, and the n-gram input's bank.
+fn block_state(block: &Block, hidden: u64) -> Result<Vec<Stateful<'_>>, String> {
     let mut state = Vec::new();
     let mut mixers = 0;
     for sublayer in &block.sublayers {
-        let stateful = match &sublayer.op {
-            Operator::Attention(attention) => Stateful::Attention(attention),
-            Operator::GatedDelta(delta) => Stateful::GatedDelta(delta),
-            Operator::ShortConv(convolution) => Stateful::ShortConv(convolution),
-            Operator::StateSpace(space) => Stateful::StateSpace(space),
+        match &sublayer.op {
+            Operator::Attention(attention) => {
+                mixers += 1;
+                if mixers > 1 {
+                    return Err("a block holds more than one stateful mixer".into());
+                }
+                state.push(Stateful::Attention(attention));
+                if let Some(rows) = projected_rows(attention) {
+                    let kv_channels = attention
+                        .kv_heads
+                        .checked_mul(attention.width)
+                        .ok_or("attention KV channels overflow")?;
+                    if let Some(conv) = &rows.key_conv {
+                        state.push(Stateful::CausalShortConv {
+                            conv,
+                            channels: kv_channels,
+                        });
+                    }
+                    if let Some(conv) = &rows.value_conv {
+                        state.push(Stateful::CausalShortConv {
+                            conv,
+                            channels: kv_channels,
+                        });
+                    }
+                }
+            }
+            Operator::GatedDelta(delta) => {
+                mixers += 1;
+                if mixers > 1 {
+                    return Err("a block holds more than one stateful mixer".into());
+                }
+                state.push(Stateful::GatedDelta(delta));
+            }
+            Operator::ShortConv(convolution) => {
+                mixers += 1;
+                if mixers > 1 {
+                    return Err("a block holds more than one stateful mixer".into());
+                }
+                state.push(Stateful::ShortConv(convolution));
+            }
+            Operator::StateSpace(space) => {
+                mixers += 1;
+                if mixers > 1 {
+                    return Err("a block holds more than one stateful mixer".into());
+                }
+                state.push(Stateful::StateSpace(space));
+            }
             Operator::NGramInput(input) => {
                 state.push(Stateful::NGram(input));
-                continue;
             }
-            Operator::DenseFfn(_) | Operator::RoutedFfn(_) | Operator::PerLayerInput(_) => continue,
+            Operator::DenseFfn(_) | Operator::RoutedFfn(_) | Operator::PerLayerInput(_) => {}
             Operator::Parallel(branches)
                 if branches.iter().all(|branch| {
                     matches!(
                         branch.op,
                         Operator::DenseFfn(_) | Operator::RoutedFfn(_) | Operator::PerLayerInput(_)
                     )
-                }) =>
-            {
-                continue;
-            }
+                }) => {}
             op @ Operator::Parallel(_) => {
                 return Err(format!("{} state has no layout yet", op.name()));
             }
-        };
-        mixers += 1;
-        if mixers > 1 {
-            return Err("a block holds more than one stateful mixer".into());
         }
-        state.push(stateful);
+        if let Some(conv) = &sublayer.post_conv {
+            state.push(Stateful::CausalShortConv {
+                conv,
+                channels: hidden,
+            });
+        }
     }
     Ok(state)
 }
@@ -644,8 +692,13 @@ fn history_component(
 /// refusal of a lossy codec ([`kv_codec_policy`]) all follow it.
 fn model_store(attention: &Attention) -> bool {
     attention.history.len() > 1
+        || attention.relative_bias.is_some()
+        || matches!(attention.sinks, AttentionSinks::Dynamic(_))
         || projected_rows(attention).is_some_and(|rows| {
-            rows.rounding != RowRounding::None || rows.value == ValueSource::StoredKey
+            rows.rounding != RowRounding::None
+                || rows.value == ValueSource::StoredKey
+                || rows.key_conv.is_some()
+                || rows.value_conv.is_some()
         })
 }
 
@@ -854,6 +907,19 @@ fn short_convolution_bank(convolution: &ShortConv) -> Result<BankComponent, Stri
     })
 }
 
+/// A generalized causal short convolution's bank (`CausalShortConv`): its
+/// window of `kernel_size - 1` past frames plus tape rows in F32.
+fn causal_short_conv_bank(
+    convolution: &CausalShortConv,
+    channels: u64,
+) -> Result<BankComponent, String> {
+    Ok(BankComponent::ConvWindow {
+        width: host(convolution.kernel_size, "causal short convolution width")?,
+        channels: host(channels, "causal short convolution channels")?,
+        dtype: DType::F32,
+    })
+}
+
 /// A Mamba-2 layer's bank: the window of raw `xBC` projection rows in
 /// activation precision, the F32 state, and the tape of the additive rule.
 fn state_space_bank(space: &StateSpace, activation: DType) -> Result<[BankComponent; 3], String> {
@@ -986,9 +1052,11 @@ mod tests {
 
     fn block(op: Operator) -> Block {
         Block {
+            transition: None,
             sublayers: vec![Sublayer {
                 input: InputNorm::Rms(norm(32)),
                 op,
+                post_conv: None,
                 output: OutputForm::Residual,
             }],
         }
@@ -1012,6 +1080,8 @@ mod tests {
             value,
             key_norm: HeadNorm::None,
             value_norm: ValueNorm::None,
+            key_conv: None,
+            value_conv: None,
             domain,
             rounding: RowRounding::None,
         }))
@@ -1044,9 +1114,11 @@ mod tests {
                 sections: vec![2, 1, 1],
                 axis_pattern: vec![0, 1, 2],
             },
+            relative_bias: None,
             scale: 1.0,
+            log_scale: None,
             media_rows: MediaRowAttention::Causal,
-            sinks: None,
+            sinks: magnitude_family_contracts::AttentionSinks::None,
             output: OutputProjection::Full(weight(&[32, 128])),
         }))
     }
@@ -1068,6 +1140,7 @@ mod tests {
             exit: ExitForm {
                 norm: ExitNorm::Rms(norm(32)),
                 output: weight(&[64, 32]),
+                unpadded_vocabulary: None,
                 softcap: None,
             },
         }
@@ -1238,15 +1311,18 @@ mod tests {
         let mut decoder = decoder(
             ActivationDType::BF16,
             vec![Block {
+                transition: None,
                 sublayers: vec![
                     Sublayer {
                         input: InputNorm::Rms(norm(32)),
                         op: Operator::ShortConv(Box::new(short)),
+                        post_conv: None,
                         output: OutputForm::Residual,
                     },
                     Sublayer {
                         input: InputNorm::None,
                         op: Operator::NGramInput(Box::new(ngram)),
+                        post_conv: None,
                         output: OutputForm::Residual,
                     },
                 ],
@@ -1443,6 +1519,8 @@ mod tests {
             value: ValueSource::StoredKey,
             key_norm: HeadNorm::Rms(norm(V41_WIDTH)),
             value_norm: ValueNorm::None,
+            key_conv: None,
+            value_conv: None,
             domain: TokenDomain::Window { tokens: 128 },
             rounding: block_rounding(BlockElement::E4M3, 32, BlockScale::Ue8m0, 1e-4),
         })))

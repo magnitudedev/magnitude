@@ -1057,7 +1057,7 @@ pub(super) fn glu_limit(
     entry: &'static str,
     bindings: &str,
 ) -> Result<Tensor, CatalogFailure> {
-    semantic_i32(charges, &[0, magnitude_family_contracts::GluLimit::word(limit)], &[], entry, bindings)
+    semantic_i32(charges, &[0, crate::operators::glu_limit_word(limit)], &[], entry, bindings)
 }
 
 /// A unit accumulator scale for `kernel`'s scale port whose static is

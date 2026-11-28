@@ -145,10 +145,12 @@ fn bank_of(groups: &[usize], slots: u64, experts: impl Fn(usize) -> u64, form: R
                 .unwrap();
             let first = layers.len();
             for _ in 0..members {
+                let visit = layers.len();
                 layers.push(BankLayer {
                     scope: WeightScope::Target,
                     group: index,
-                    experts: experts(layers.len()),
+                    physical_stack: visit,
+                    experts: experts(visit),
                     selected: 8,
                     resident: form.each(|_| Ok::<_, ()>(resident())).unwrap(),
                     shared_down: None,
@@ -2458,6 +2460,64 @@ fn class_wide_hard_capacities_hold_for_short_prompts_and_chained_head_steps() {
         let used: std::collections::BTreeSet<u64> = (1..=15).map(|step| step % slots).collect();
         assert_eq!(used.len(), 15, "15 chained head steps must occupy 15 distinct site/publication slots");
     }
+}
+
+/// Looped MoE models unroll `P` physical expert stacks across `V > P` visits
+/// (e.g. 2 physical stacks visited twice => 4 monotonic visits). The bank must
+/// allocate and charge only `P` stacks, map shared visits to the exact same
+/// home record / slot map slice, allocate `TierMap` and `expert_scales` once
+/// per physical stack, and preserve monotonic `visit_layer` execution order.
+#[test]
+fn shared_physical_stacks_allocate_p_stacks_and_share_homes_across_visits() {
+    let base = bank_of(&[2], 64, |_| 128, RecordForm::Gated);
+    let rep0 = base.layers()[0].clone();
+    let rep1 = base.layers()[1].clone();
+    let sub = |block| WeightScope::TargetSublayer(magnitude_family_contracts::SublayerIndex { block, sublayer: 0 });
+    // Unroll 2 physical stacks (0, 1) across 4 visits: [stack 0, stack 1, stack 0, stack 1].
+    let looped_layers = vec![
+        BankLayer { scope: sub(0), physical_stack: 0, ..rep0.clone() },
+        BankLayer { scope: sub(1), physical_stack: 1, ..rep1.clone() },
+        BankLayer { scope: sub(2), physical_stack: 0, ..rep0 },
+        BankLayer { scope: sub(3), physical_stack: 1, ..rep1 },
+    ];
+    let layers = BankLayers::new(looped_layers).expect("valid looped BankLayers");
+    assert_eq!(layers.len(), 4, "4 monotonic visit layers");
+    assert_eq!(layers.num_stacks(), 2, "2 distinct physical stacks");
+    assert_eq!(layers.stack_representatives(), &[0, 1]);
+    assert_eq!(layers.last_visits(), &[2, 3]);
+    assert_eq!(layers.next_visit_of(0), Some(2));
+    assert_eq!(layers.next_visit_of(1), Some(3));
+    assert_eq!(layers.next_visit_of(2), None);
+    assert_eq!(layers.next_visit_of(3), None);
+
+    // Group holds only the representative visit of each physical stack (0, 1).
+    let groups = vec![BankGroup {
+        record: base.groups()[0].record,
+        layers: NonEmpty::new(vec![0, 1]).unwrap(),
+    }];
+    let structured = conveyor::Structured::new(8, HostTier::Linked, groups, layers, None, VERIFY_ROWS).unwrap();
+    let allocations = seismic::NativeAllocations::EXACT;
+    let blocks = size_pool_blocks(structured.granules(), allocations).unwrap();
+    let looped = ExpertBankPlan { structured, blocks, ..base.clone() };
+
+    assert_eq!(looped.num_stacks(), 2);
+    assert_eq!(looped.home(0), looped.home(2), "shared visits map to the same home");
+    assert_eq!(looped.home(1), looped.home(3), "shared visits map to the same home");
+    assert_ne!(looped.home(0), looped.home(1));
+    assert_eq!(looped.group_experts(0), base.group_experts(0), "group experts count P stacks, not V visits");
+    assert_eq!(looped.records(0), base.records(0), "group records allocate P stacks, not V visits");
+    assert_eq!(looped.slot_bytes().unwrap(), base.slot_bytes().unwrap(), "slot bytes count P stacks");
+    assert_eq!(looped.unheld_bytes().unwrap(), base.unheld_bytes().unwrap(), "unheld bytes count P stacks");
+
+    let layout = looped.layout().unwrap();
+    assert_eq!(layout.layers.len(), 4, "execution words exist for all V visits");
+    assert!(layout.layers[0].tier.is_some() && layout.layers[1].tier.is_some(), "representative visits own TierMap");
+    assert!(layout.layers[2].tier.is_none() && layout.layers[3].tier.is_none(), "duplicate visits share TierMap");
+
+    // Invariant check: BankLayers::new rejects mismatched experts on a shared physical_stack.
+    let mut bad = looped.layers().to_vec();
+    bad[2].experts = 64;
+    assert!(BankLayers::new(bad).is_none(), "shared physical stack must agree on expert count");
 }
 
 /// Gemma 4 26B-A4B's experts stream through a CUDA bank beside a linked host

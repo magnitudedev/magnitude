@@ -81,6 +81,7 @@ fn check(vision: &VisionDescription, fused: bool) {
         positions,
         norm,
         registers,
+        ..
     } = &vision.stem
     else {
         panic!("a patch convolution stem");

@@ -3,6 +3,8 @@
 //! edge and intermediate allocation.
 
 mod block;
+pub(crate) mod block_attn_res;
+pub(crate) mod block_attn_res_graph;
 mod bound;
 mod certify;
 mod classes;

@@ -18,7 +18,7 @@ use super::{
 use crate::GeneralRoutedBinding;
 use crate::operators::routed::fused_graph::TILE_ROWS;
 use crate::planning::BankBinding;
-use magnitude_family_contracts::{GluLimit, WeightKind, WeightScope};
+use magnitude_family_contracts::{WeightKind, WeightScope};
 use magnitude_kernels::{
     routed_down, routed_down_project, routed_experts, routed_experts_up, routed_gate_up,
     routed_scatter, routed_select, routed_select_streamed, routed_up,
@@ -351,7 +351,7 @@ impl RoutedExpandDecodeTuning {
                     expert_up,
                     scales: ExpansionScales::at(inputs, scope, shape.experts_expansion.gated)?,
                     activation: shape.experts_expansion.activation,
-                    glu_limit: inputs.i32s(&[0, GluLimit::word(shape.experts_expansion.limit)], &[])?,
+                    glu_limit: inputs.i32s(&[0, crate::operators::glu_limit_word(shape.experts_expansion.limit)], &[])?,
                 })
             })
             .collect()
@@ -393,7 +393,7 @@ impl EntryTuning for RoutedGateUpTuning {
     }
 
     fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
-        let limit = GluLimit::word(self.0.binding.shape.experts_expansion.limit);
+        let limit = crate::operators::glu_limit_word(self.0.binding.shape.experts_expansion.limit);
         Ok([self.0.statics(inputs)?, vec![("LB", limit)]].concat())
     }
 
@@ -769,7 +769,7 @@ impl RoutedExpertTilesTuning {
                     expert_down: inputs.weight(scope, WeightKind::ExpertDown)?,
                     scales: ExpansionScales::at(inputs, scope, shape.experts_expansion.gated)?,
                     activation: shape.experts_expansion.activation,
-                    glu_limit: inputs.i32s(&[0, GluLimit::word(shape.experts_expansion.limit)], &[])?,
+                    glu_limit: inputs.i32s(&[0, crate::operators::glu_limit_word(shape.experts_expansion.limit)], &[])?,
                 })
             })
             .collect()
@@ -820,7 +820,7 @@ impl EntryTuning for RoutedGatedTilesTuning {
     }
 
     fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
-        let limit = GluLimit::word(self.0.binding.shape.experts_expansion.limit);
+        let limit = crate::operators::glu_limit_word(self.0.binding.shape.experts_expansion.limit);
         Ok([self.0.statics(inputs)?, vec![("LB", limit)]].concat())
     }
 

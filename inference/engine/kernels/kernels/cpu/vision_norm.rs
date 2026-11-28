@@ -17,7 +17,12 @@ fn vision_norm<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3],
     let weight = (cx.dim_nw() == 1).then(|| vision::decode_vector(&cx.arg_weight(), weight));
     let bias = (cx.dim_nb() == 1).then(|| vision::decode_vector(&cx.arg_bias(), bias));
     let source = cx.arg_source().row([from / g, from % g, 0]);
-    norm::row(source, cx.arg_centered() != 0, weight, bias, cx.arg_epsilon(), normalized);
+    let centered_code = cx.arg_centered();
+    if centered_code < 0 {
+        normalized.copy_from_slice(source);
+    } else {
+        norm::row(source, centered_code != 0, weight, bias, cx.arg_epsilon(), normalized);
+    }
     let activation = cx.arg_activation();
     if activation != 0 {
         for value in normalized.iter_mut() {

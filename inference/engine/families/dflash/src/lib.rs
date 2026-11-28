@@ -30,13 +30,14 @@ use magnitude_family_common::{
     HeaderError, Metadata, Tensors,
 };
 use magnitude_family_contracts::{
-    checked_product, ActivationFunction, Affine, Attention, AttentionGate, Block, BlockAttention,
-    BlockConvolutions, BlockLayout, CandidateCorrector, CandidateSelector, CenteredNorm,
-    ConfidenceHead, CorrectorLayer, DefinitionError, DenseFfn, DraftDefinition, DraftEmbedding,
-    DraftMethod, DynamicConvolution, FamilyError, FeedForwardUp, GluLimit, HeadNorm, HistoryRows,
-    HistorySource, HyperConnectionMixing, HyperConnections, InputNorm, LayerConvolutions,
-    MarkovHead, MediaRowAttention, ModelDefinition, Operator, OutputForm, OutputProjection,
-    OutputRotary, ProjectedRows, QueryKeys, QueryProjection, ResidualForm, RmsNorm, Rotary,
+    checked_product, ActivationFunction, Affine, Attention, AttentionGate, AttentionSinks, Block,
+    BlockAttention, BlockConvolutions, BlockLayout, CandidateCorrector, CandidateSelector,
+    CenteredNorm, ConfidenceHead, CorrectorLayer, DefinitionError, DenseFfn,
+    DraftContextProjection, DraftDefinition, DraftEmbedding, DraftFusion, DraftMask, DraftMethod,
+    DynamicConvolution, FamilyError, FeedForwardUp, GluLimit, HeadNorm, HistoryRows, HistorySource,
+    HyperConnectionMixing, HyperConnections, InputNorm, LayerConvolutions, MarkovHead,
+    MediaRowAttention, ModelDefinition, Operator, OutputForm, OutputProjection, OutputRotary,
+    ProjectedRows, QueryKeys, QueryProjection, ResidualForm, RmsNorm, RnnMarkovHead, Rotary,
     RotaryLayout, RouteNormalization, RowProducer, RowRounding, ScoreFunction, SinkhornInput,
     Sublayer, TapPoint, TokenDomain, ValueNorm, ValueSource, WeightDescriptor, CORRECTOR_FEATURES,
 };
@@ -326,16 +327,31 @@ pub fn inspect(
             "draft heads need an even width and blocks two slots".into(),
         ));
     }
-    let mask_token = directory
-        .value(MASK_TOKEN)
-        .and_then(Value::unsigned)
-        .and_then(|token| u32::try_from(token).ok())
-        .filter(|token| u64::from(*token) < decoder.vocabulary)
-        .map(TokenId)
-        .ok_or_else(|| Error::Metadata {
-            key: MASK_TOKEN.into(),
-            expected: "a token of the target's vocabulary",
-        })?;
+    if !single_pass_mhc {
+        if let Some(rope_dims) = m.optional_integer("rope.dimension_count")? {
+            if rope_dims != width {
+                return Err(Error::Geometry(format!(
+                    "draft rope.dimension_count ({rope_dims}) differs from head width ({width})"
+                )));
+            }
+        }
+    }
+    if let Some(vocab) = m.optional_integer("vocab_size")? {
+        if vocab != decoder.vocabulary {
+            return Err(Error::Target(format!(
+                "draft vocab_size ({vocab}) differs from target vocabulary ({})",
+                decoder.vocabulary
+            )));
+        }
+    }
+    if let Some(unpadded) = m.optional_integer("vocab_size_unpadded")? {
+        if unpadded != decoder.active_vocabulary() {
+            return Err(Error::Target(format!(
+                "draft vocab_size_unpadded ({unpadded}) differs from target active vocabulary ({})",
+                decoder.active_vocabulary()
+            )));
+        }
+    }
 
     let taps = m
         .counts("target_layers")?
@@ -351,11 +367,42 @@ pub fn inspect(
     // Projections and tables carry their NVFP4 second-level scale (`X.scale`
     // beside `X.weight`, `[1]` F32) when the file stores one.
     let mut binder = Tensors::new(directory);
-    let fusion = binder.bind(
-        "fc.weight",
-        &[hidden, product(&[taps.len() as u64, hidden])?],
-    )?;
-    let fusion_norm = rms(binder.bind("enc.output_norm.weight", &[hidden])?);
+    let mask = if binder.contains("mask_embd.weight") {
+        DraftMask::Learned(binder.bind("mask_embd.weight", &[hidden])?)
+    } else {
+        let mask_token = directory
+            .value(MASK_TOKEN)
+            .and_then(Value::unsigned)
+            .and_then(|token| u32::try_from(token).ok())
+            .filter(|token| u64::from(*token) < decoder.vocabulary)
+            .map(TokenId)
+            .ok_or_else(|| Error::Metadata {
+                key: MASK_TOKEN.into(),
+                expected: "a token of the target's vocabulary",
+            })?;
+        DraftMask::Token(mask_token)
+    };
+    let rnn_markov = binder.contains("markov_rnn_proj.weight");
+    let fusion = if binder.contains("fuse_weight.weight") {
+        let outputs = block_count + u64::from(rnn_markov);
+        let weights = binder.bind("fuse_weight.weight", &[outputs, taps.len() as u64])?;
+        let mut norms = Vec::with_capacity(outputs as usize);
+        for index in 0..block_count {
+            norms.push(rms(binder.bind(&format!("blk.{index}.dflare_norm.weight"), &[hidden])?));
+        }
+        if rnn_markov {
+            norms.push(rms(binder.bind("markov_dflare_norm.weight", &[hidden])?));
+        }
+        DraftFusion::SoftmaxMix { weights, norms }
+    } else {
+        DraftFusion::Linear {
+            projection: binder.bind(
+                "fc.weight",
+                &[hidden, product(&[taps.len() as u64, hidden])?],
+            )?,
+            norm: rms(binder.bind("enc.output_norm.weight", &[hidden])?),
+        }
+    };
     let output_norm = rms(binder.bind("output_norm.weight", &[hidden])?);
     let embedding = if binder.contains("token_embd.weight") {
         DraftEmbedding::Own(binder.bind("token_embd.weight", &[decoder.vocabulary, hidden])?)
@@ -367,7 +414,9 @@ pub fn inspect(
     } else {
         None
     };
-
+    let has_context_projections = binder.contains("blk.0.attn_k_ctx.weight");
+    let mut context_projections = has_context_projections
+        .then(|| Vec::with_capacity(block_count as usize));
     let (residual, blocks, block_attention) = if single_pass_mhc {
         deepseek41_dspark_blocks(
             &m,
@@ -394,9 +443,9 @@ pub fn inspect(
                 let role = |role: &str| format!("blk.{index}.{role}.weight");
                 let sinks = role("attn_sinks");
                 let sinks = if binder.contains(&sinks) {
-                    Some(binder.bind(&sinks, &[heads])?)
+                    AttentionSinks::Static(binder.bind(&sinks, &[heads])?)
                 } else {
-                    None
+                    AttentionSinks::None
                 };
                 let mut weight = |name: &str, shape: &[u64]| binder.bind(&role(name), shape);
                 let attention = Attention {
@@ -411,6 +460,8 @@ pub fn inspect(
                         RowProducer::Projected(ProjectedRows {
                             key: weight("attn_k", &[key_rows, hidden])?,
                             value: ValueSource::Projected(weight("attn_v", &[key_rows, hidden])?),
+                            key_conv: None,
+                            value_conv: None,
                             key_norm: HeadNorm::Rms(rms(weight("attn_k_norm", &[width])?)),
                             value_norm: ValueNorm::None,
                             domain,
@@ -418,11 +469,20 @@ pub fn inspect(
                         }),
                     ))],
                     rotary: rotary.clone(),
+                    relative_bias: None,
+                    log_scale: None,
                     scale: 1.0 / (width as f64).sqrt(),
                     media_rows: MediaRowAttention::Causal,
                     sinks,
                     output: OutputProjection::Full(weight("attn_output", &[hidden, query_rows])?),
                 };
+                if let Some(projections) = &mut context_projections {
+                    projections.push(DraftContextProjection {
+                        key: weight("attn_k_ctx", &[key_rows, hidden])?,
+                        value: weight("attn_v_ctx", &[key_rows, hidden])?,
+                        key_norm: HeadNorm::Rms(rms(weight("attn_k_norm_ctx", &[width])?)),
+                    });
+                }
                 let feed_forward = DenseFfn {
                     intermediate,
                     up: FeedForwardUp::Gated {
@@ -438,14 +498,17 @@ pub fn inspect(
                         Sublayer {
                             input: InputNorm::Rms(rms(weight("attn_norm", &[hidden])?)),
                             op: Operator::Attention(Box::new(attention)),
+                            post_conv: None,
                             output: OutputForm::Residual,
                         },
                         Sublayer {
                             input: InputNorm::Rms(rms(weight("ffn_norm", &[hidden])?)),
                             op: Operator::DenseFfn(Box::new(feed_forward)),
+                            post_conv: None,
                             output: OutputForm::Residual,
                         },
                     ],
+                    transition: None,
                 })
             })
             .collect::<Result<Vec<_>, Error>>()?;
@@ -486,6 +549,12 @@ pub fn inspect(
                 .into(),
         ));
     }
+    let declared_markov_rank = m.optional_integer("markov_rank")?;
+    if !dspark && declared_markov_rank.is_some() {
+        return Err(Error::Geometry(
+            "markov_rank metadata without a Markov head".into(),
+        ));
+    }
     let method = if dflash2 {
         if convolutions.is_none() {
             return Err(Error::Geometry(
@@ -512,38 +581,71 @@ pub fn inspect(
             .and_then(|tensor| tensor.shape.get(1).copied())
             .filter(|rank| *rank > 0)
             .ok_or_else(|| Error::Geometry("Markov embedding has no rank".into()))?;
-        let table = [decoder.vocabulary, rank];
-        let markov = MarkovHead {
-            rank,
-            embedding: binder.bind("markov_w1.weight", &table)?,
-            projection: binder.bind("markov_w2.weight", &table)?,
-        };
-        if m.optional_flag("has_confidence_head")? == Some(false) {
-            return Err(Error::Geometry(
-                "a DSpark draft without its confidence head is not admitted".into(),
-            ));
+        if let Some(declared) = declared_markov_rank {
+            if declared != rank {
+                return Err(Error::Geometry(format!(
+                    "markov_rank ({declared}) differs from markov_w1.weight width ({rank})"
+                )));
+            }
         }
-        let conf_weight_shape = directory
-            .tensor("conf_proj.weight")
-            .map(|tensor| tensor.shape.as_slice());
-        let confidence = if conf_weight_shape == Some(&[1, hidden + rank]) {
-            ConfidenceHead {
-                weight: binder.bind("conf_proj.weight", &[1, hidden + rank])?,
-                bias: if binder.contains("conf_proj.bias") {
-                    Some(binder.bind("conf_proj.bias", &[1])?)
-                } else {
-                    None
+        let table = [decoder.vocabulary, rank];
+        let markov = if rnn_markov {
+            let rnn_out = product(&[3, rank])?;
+            let rnn_in = product(&[2, rank])?
+                .checked_add(product(&[2, hidden])?)
+                .ok_or_else(|| Error::Geometry("Markov RNN input width overflows".into()))?;
+            MarkovHead::RnnHidden(RnnMarkovHead {
+                rank,
+                embedding: binder.bind("markov_w1.weight", &table)?,
+                rnn_proj: Affine {
+                    weight: binder.bind("markov_rnn_proj.weight", &[rnn_out, rnn_in])?,
+                    bias: binder.bind("markov_rnn_proj.bias", &[rnn_out])?,
                 },
-            }
+                hidden_out: Affine {
+                    weight: binder.bind("markov_hidden_out.weight", &[hidden, rank])?,
+                    bias: binder.bind("markov_hidden_out.bias", &[hidden])?,
+                },
+            })
         } else {
-            ConfidenceHead {
-                weight: binder.bind("conf_proj.weight", &[hidden + rank])?,
+            MarkovHead::Bilinear {
+                rank,
+                embedding: binder.bind("markov_w1.weight", &table)?,
+                projection: binder.bind("markov_w2.weight", &table)?,
+            }
+        };
+        let has_conf_flag = m.optional_flag("has_confidence_head")?;
+        let confidence = if binder.contains("conf_proj.weight") {
+            if has_conf_flag == Some(false) {
+                return Err(Error::Geometry(
+                    "a DSpark draft without its confidence head is not admitted".into(),
+                ));
+            }
+            let conf_weight_shape = directory
+                .tensor("conf_proj.weight")
+                .map(|tensor| tensor.shape.as_slice());
+            let weight_shape: &[u64] = if conf_weight_shape == Some(&[1, hidden + rank]) {
+                &[1, hidden + rank]
+            } else {
+                &[hidden + rank]
+            };
+            Some(ConfidenceHead {
+                weight: binder.bind("conf_proj.weight", weight_shape)?,
                 bias: if binder.contains("conf_proj.bias") {
                     Some(binder.bind("conf_proj.bias", &[1])?)
                 } else {
                     None
                 },
+            })
+        } else {
+            if has_conf_flag == Some(true) {
+                return Err(Error::MissingWeight("conf_proj.weight".into()));
             }
+            if !rnn_markov && has_conf_flag == Some(false) {
+                return Err(Error::Geometry(
+                    "a DSpark draft without its confidence head is not admitted".into(),
+                ));
+            }
+            None
         };
         DraftMethod::DSpark { markov, confidence }
     } else {
@@ -566,18 +668,18 @@ pub fn inspect(
         method,
         taps,
         fusion,
-        fusion_norm,
         embedding,
         output,
         embedding_scale: m.optional_positive_number("embedding_scale")?.unwrap_or(1.0),
         residual,
         blocks,
         block_attention,
+        context_projections,
         convolutions,
         output_norm,
         logit_softcap: m.optional_number("final_logit_softcapping")?.filter(|cap| *cap != 0.0),
         block_size,
-        mask_token,
+        mask,
         layout,
     };
     m.finish()?;
@@ -963,6 +1065,7 @@ fn deepseek41_dspark_blocks(
         .map_err(|error| Error::Geometry(error.to_string()))?;
         blocks.push(Block {
             sublayers: vec![attn_sublayer, ffn_sublayer],
+            transition: None,
         });
     }
     Ok((residual, blocks, block_attention))

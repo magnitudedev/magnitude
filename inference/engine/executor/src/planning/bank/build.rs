@@ -76,6 +76,8 @@ impl ModelLoadPlan {
         }
         let mut layers: Vec<BankLayer> = Vec::new();
         let mut groups: Vec<BankGroup> = Vec::new();
+        // Distinct physical expert stacks in first-seen order: `(storage identity, is_draft, group)`.
+        let mut stack_identities: Vec<(super::RecordTensors<crate::planning::WeightStorageIdentity>, bool, usize)> = Vec::new();
         // Every streamed layer's selection order: a layer's hints rank the
         // next layer's choices by this layer's, reading the next layer's
         // weights as its own elements (`routed_select_streamed`,
@@ -139,19 +141,31 @@ impl ModelLoadPlan {
                 Err(PlanError::Unstreamed(_)) if is_draft => continue,
                 Err(error) => return Err(error),
             };
-            let group = match groups.iter().position(|group| {
-                group.record == record && layers[group.layers[0]].is_draft() == is_draft
-            }) {
-                Some(group) => {
-                    groups[group].layers.push(layers.len());
-                    group
-                }
+            let identity = resident.as_ref().map(|_, plan| plan.storage_identity());
+            let (physical_stack, group) = match stack_identities
+                .iter()
+                .position(|(known, known_draft, _)| *known == identity && *known_draft == is_draft)
+            {
+                Some(stack) => (stack, stack_identities[stack].2),
                 None => {
-                    groups.push(BankGroup {
-                        record,
-                        layers: NonEmpty::one(layers.len()),
-                    });
-                    groups.len() - 1
+                    let group = match groups.iter().position(|group| {
+                        group.record == record && layers[group.layers[0]].is_draft() == is_draft
+                    }) {
+                        Some(group) => {
+                            groups[group].layers.push(layers.len());
+                            group
+                        }
+                        None => {
+                            groups.push(BankGroup {
+                                record,
+                                layers: NonEmpty::one(layers.len()),
+                            });
+                            groups.len() - 1
+                        }
+                    };
+                    let stack = stack_identities.len();
+                    stack_identities.push((identity, is_draft, group));
+                    (stack, group)
                 }
             };
             let shared_down = is_fused(routed)
@@ -161,6 +175,7 @@ impl ModelLoadPlan {
             layers.push(BankLayer {
                 scope,
                 group,
+                physical_stack,
                 experts: routed.experts,
                 selected: routed.selected,
                 resident,

@@ -123,6 +123,8 @@ pub fn describe_projector(
                 down: linear(&mut t, &format!("{p}ffn_down"), hidden, intermediate, Vec::new())?,
             },
             feedforward_post_norm: None,
+            ls1: None,
+            ls2: None,
         });
     }
     let shuffled = product(&[hidden, merge, merge])?;
@@ -171,6 +173,7 @@ pub fn describe_projector(
             }),
             norm: Some(pre_norm),
             registers: None,
+            register_positions: None,
         },
         window: Some(side),
         blocks,

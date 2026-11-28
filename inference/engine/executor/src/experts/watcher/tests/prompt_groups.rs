@@ -1741,6 +1741,8 @@ fn async_dma_scratch_ring_deepseek_stress() {
             let round_bounds = ListBounds { from: STRESS_CONVEYOR, to: STRESS_EXPERTS as u64, lent: 0 };
             Layer {
                 group: 0,
+                stack: index,
+                next_visit: None,
                 draft: false,
                 experts: STRESS_EXPERTS,
                 layer_window: STRESS_EXPERTS,
@@ -1781,6 +1783,7 @@ fn async_dma_scratch_ring_deepseek_stress() {
     let watcher = Watcher::start_with_bounds(
         WatcherParts {
             layers,
+            footprints: Vec::new(),
             group_reads: reads.iter().map(|r| PlacedLayerWords { group_reads: r.clone(), stride: STRESS_EXPERTS }).collect(),
             groups: vec![Group {
                 commits,
@@ -2120,6 +2123,8 @@ fn async_dma_delayed_layer_reader_preserves_window_table_and_held_bank_payload_a
             let round_bounds = ListBounds { from: CONVEYOR_RECS, to: EXP as u64, lent: 0 };
             Layer {
                 group: 0,
+                stack: index,
+                next_visit: None,
                 draft: false,
                 experts: EXP,
                 layer_window: EXP,
@@ -2159,6 +2164,7 @@ fn async_dma_delayed_layer_reader_preserves_window_table_and_held_bank_payload_a
     let watcher = Watcher::start_with_bounds(
         WatcherParts {
             layers,
+            footprints: Vec::new(),
             group_reads: reads.iter().map(|r| PlacedLayerWords { group_reads: r.clone(), stride: EXP }).collect(),
             groups: vec![Group {
                 commits: commits.clone(),

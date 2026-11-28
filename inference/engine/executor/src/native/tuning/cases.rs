@@ -183,7 +183,7 @@ impl EntryTuning for DenseExpandTuning {
             ("F", features),
             ("GS", scale_extent(inputs, &self.scopes, self.gate_kind)?),
             ("US", scale_extent(inputs, &self.scopes, self.up_kind)?),
-            ("LB", GluLimit::word(self.limit)),
+            ("LB", crate::operators::glu_limit_word(self.limit)),
         ];
         statics.extend(packing_statics(
             inputs,
@@ -221,7 +221,7 @@ impl EntryTuning for DenseExpandTuning {
                     up_scale: inputs.unit_scale(inputs.scale_extent(scope, self.up_kind)?)?,
                     gate_bound: inputs.bound(scope, self.gate_kind)?,
                     up_bound: inputs.bound(scope, self.up_kind)?,
-                    glu_limit: inputs.i32s(&[0, GluLimit::word(self.limit)], &[])?,
+                    glu_limit: inputs.i32s(&[0, crate::operators::glu_limit_word(self.limit)], &[])?,
                     gate,
                     epsilon: self.epsilon,
                     function: self.function,

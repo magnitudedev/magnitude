@@ -271,6 +271,8 @@ pub(crate) fn declared_model(
                             false,
                         ))),
                         value_norm: ValueNorm::None,
+                        key_conv: None,
+                        value_conv: None,
                         domain: TokenDomain::Token,
                         rounding: RowRounding::None,
                     },
@@ -286,9 +288,11 @@ pub(crate) fn declared_model(
                     sections: vec![c.rotary_width / 2],
                     axis_pattern: vec![0],
                 },
+                relative_bias: None,
                 scale: 1.0 / (c.head_width as f64).sqrt(),
+                log_scale: None,
                 media_rows: MediaRowAttention::Causal,
-                sinks: None,
+                sinks: magnitude_family_contracts::AttentionSinks::None,
                 output: OutputProjection::Full(tensor(
                     name("attn_output"),
                     vec![c.hidden, c.heads * c.head_width],
@@ -402,15 +406,18 @@ pub(crate) fn declared_model(
             })),
         };
         blocks.push(Block {
+            transition: None,
             sublayers: vec![
                 Sublayer {
                     input: InputNorm::Rms(rms(input_norm)),
                     op: mixer,
+                    post_conv: None,
                     output: OutputForm::Residual,
                 },
                 Sublayer {
                     input: InputNorm::Rms(rms(feedforward_norm)),
                     op: feedforward,
+                    post_conv: None,
                     output: OutputForm::Residual,
                 },
             ],
@@ -443,6 +450,7 @@ pub(crate) fn declared_model(
             exit: ExitForm {
                 norm: ExitNorm::Rms(rms(output_norm)),
                 output,
+                unpadded_vocabulary: None,
                 softcap: None,
             },
         },

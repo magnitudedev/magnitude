@@ -1534,7 +1534,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         // The continuation follows the tokens fed so far.
         let preceding = self.target_preceding(predicted, ahead).map_err(DomainError::Input)?;
         let class_limits = self.target_class_limits();
-        let vocabulary = self.definition.decoder.vocabulary as usize;
+        let vocabulary = self.definition.decoder.active_vocabulary() as usize;
         let batch = match tokens {
             SuccessorTokens::Selected { .. } => ValidatedTargetBatch::from_slots(&slots, vocabulary, class_limits),
             SuccessorTokens::Host => ValidatedTargetBatch::covering(&slots, vocabulary, class_limits, segments),

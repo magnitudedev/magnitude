@@ -370,8 +370,9 @@ impl Stored {
     /// The stored tensor `weight` imports: the artifact's tensor `weight`
     /// names ([`Self::from_gguf`]), of which, where `leading`, a plan of an
     /// expert stack's first experts (`WeightPlan::leading`), only those first
-    /// rows. A dense weight's plan may differ from its stored rows by its
-    /// transforms, which no prefix of the stored bytes stands for.
+    /// rows. A weight whose transforms act per leading record (such as
+    /// splitting a fused gate+up stack along its inner row axis) is verified
+    /// against `weight.descriptor.transformed_shape(leading.shape())`.
     pub fn of_plan(
         artifact: &GgufArtifact,
         weight: &crate::WeightPlan,
@@ -381,19 +382,27 @@ impl Stored {
         if !leading {
             return Ok(stored);
         }
-        let (Some(&rows), Some(&stored_rows)) = (weight.shape.first(), stored.shape().first()) else {
+        stored.leading_for_plan(weight)
+    }
+
+    fn leading_for_plan(self, weight: &crate::WeightPlan) -> Result<Self, WeightImportError> {
+        let (Some(&rows), Some(&stored_rows)) = (weight.shape.first(), self.shape().first()) else {
             return Err(invalid(format!("{:?} has no leading dimension", weight.descriptor.name)));
         };
         let name = &weight.descriptor.name;
-        let leading = stored
+        let leading = self
             .leading(rows)
             .map_err(|reason| invalid(format!("{rows} leading rows of {name:?} ({stored_rows} stored): {reason}")))?;
-        match leading.shape()[1..] == weight.shape[1..] {
+        let transformed = weight
+            .descriptor
+            .transformed_shape(leading.shape())
+            .map_err(|reason| invalid(format!("leading shape {:?} of {name:?}: {reason}", leading.shape())))?;
+        match transformed == weight.shape {
             true => Ok(leading),
             false => Err(invalid(format!(
-                "the planned shape {:?} of {name:?} differs from its stored {:?}",
+                "the planned shape {:?} of {name:?} differs from its transformed stored {:?}",
                 weight.shape,
-                stored.shape()
+                transformed
             ))),
         }
     }
@@ -1240,7 +1249,7 @@ impl ResidencyStore {
         let bank = crate::experts::ExpertBank::open(charges, plan, artifact, draft, &sites, lines, &self.cpu_site, self.pools.clone(), (self.changes.clone(), self.host_backing.take()))?;
         // Each stack through the entry a resident load imports it with, from
         // a read around the file cache: no expert byte stays in it.
-        if plan.whole() {
+        if plan.resident {
             bank.import_whole(&mut |weight, records, record_at| {
                 let entry = self.programs.import_entry(weight).map_err(|error| error.to_string())?;
                 let source_artifact = match weight.role.scope {
@@ -2299,6 +2308,68 @@ mod tests {
         assert_eq!(
             weight.leading(4).unwrap_err(),
             "it appends stored parts, whose rows no prefix of its own bytes holds"
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A fused expert stack (such as `ffn_gate_up_exps.weight`, whose
+    /// `ImportTransform::Rows` slices each expert's inner row axis) passes
+    /// leading-slice validation against its transformed leading shape rather
+    /// than its raw stored shape.
+    #[test]
+    fn leading_for_plan_checks_transformed_shape_for_fused_stacks() {
+        use magnitude_family_contracts::{ImportTransform, RowRange};
+
+        let path = std::env::temp_dir().join(format!("magnitude-leading-fused-{}.bin", std::process::id()));
+        std::fs::write(&path, vec![0u8; 384 * 64]).unwrap();
+        let source = Arc::new(FileSource::open(&path).unwrap());
+        let stored = Stored::GgmlBlocks {
+            source,
+            offset: 0,
+            nbytes: 384 * 64,
+            shape: vec![384, 4608, 4608],
+            encoding: Encoding::Q4K,
+            grid: None,
+            parts: Vec::new(),
+        };
+        let descriptor = WeightDescriptor {
+            name: "blk.0.ffn_gate_up_exps.weight".into(),
+            shape: vec![384, 2304, 4608],
+            transforms: vec![ImportTransform::Rows(RowRange { start: 0, rows: 2304 })],
+        };
+        let plan = crate::WeightPlan {
+            role: magnitude_family_contracts::WeightRole {
+                scope: magnitude_family_contracts::WeightScope::Target,
+                kind: magnitude_family_contracts::WeightKind::ExpertGate,
+            },
+            component: crate::planning::ArtifactComponent {
+                kind: crate::planning::ArtifactComponentKind::Target,
+                identity: magnitude_artifacts::ArtifactIdentity([0; 32]),
+            },
+            descriptor,
+            source: Element::named("gguf_q4_k").unwrap(),
+            upload: Element::named("gguf_q4_k").unwrap(),
+            resident: Element::named("gguf_q4_k").unwrap(),
+            shape: vec![8, 2304, 4608],
+            source_bytes: 8 * 64,
+            resident_bytes: 8 * 32,
+            scale: None,
+            bound: 0,
+            holding: crate::Holding::Whole,
+        };
+        let sliced = stored
+            .clone()
+            .leading_for_plan(&plan)
+            .expect("transformed leading shape matches fused gate_up plan");
+        assert_eq!(sliced.shape(), &[8, 4608, 4608]);
+
+        let mismatched = crate::WeightPlan {
+            shape: vec![8, 1024, 4608],
+            ..plan
+        };
+        assert!(
+            stored.leading_for_plan(&mismatched).is_err(),
+            "mismatched transformed shape must still be rejected"
         );
         std::fs::remove_file(&path).unwrap();
     }

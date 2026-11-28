@@ -6,7 +6,8 @@
 
 use crate::Metadata;
 use magnitude_family_contracts::{
-    ActivationFunction, Attention, AttentionGate, BlockElement, BlockRounding, BlockScale,
+    ActivationFunction, Attention, AttentionGate, AttentionSinks, BlockElement, BlockRounding,
+    BlockScale,
     ExpertSelection, FamilyError, FeedForwardUp, GluLimit, HeadNorm, HistoryRows, HistorySource,
     HyperConnectionInput, HyperConnectionWeights, InputNorm, MediaRowAttention, Operator,
     OutputForm, OutputProjection, ProjectedRows, QueryKeys, QueryProjection, RmsNorm, Rotary,
@@ -85,6 +86,7 @@ pub fn sinkhorn_sited(
             }),
         }),
         op,
+        post_conv: None,
         output: OutputForm::Scatter,
     })
 }
@@ -223,6 +225,8 @@ pub fn mla_window_attention(
             RowProducer::Projected(ProjectedRows {
                 key: weight("attn_kv.weight", &[width, hidden])?,
                 value: ValueSource::StoredKey,
+                key_conv: None,
+                value_conv: None,
                 key_norm: HeadNorm::Rms(rms(weight("attn_kv_a_norm.weight", &[width])?)),
                 value_norm: ValueNorm::None,
                 domain: TokenDomain::Window { tokens: window },
@@ -233,9 +237,11 @@ pub fn mla_window_attention(
         .chain(extra_history)
         .collect(),
         rotary,
+        relative_bias: None,
+        log_scale: None,
         scale: (width as f64).powf(-0.5),
         media_rows: MediaRowAttention::Causal,
-        sinks: Some(weight("attn_sinks.weight", &[heads])?),
+        sinks: AttentionSinks::Static(weight("attn_sinks.weight", &[heads])?),
         output: OutputProjection::GroupedLowRank {
             groups,
             rank: output_rank,

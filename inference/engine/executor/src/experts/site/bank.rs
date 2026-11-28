@@ -82,8 +82,12 @@ fn site_layer(
             })
             .transpose()
     };
-    let layer = &layout.layers[index];
-    let scales = SiteScales { gate: scales(&layer.expert_scales.gate.clone().flatten())?, up: scales(&layer.expert_scales.up)? };
+    let rep = plan.stack_representative(plan.stack_of(index));
+    let scales_layer = &layout.layers[rep];
+    let scales = SiteScales {
+        gate: scales(&scales_layer.expert_scales.gate.clone().flatten())?,
+        up: scales(&scales_layer.expert_scales.up)?,
+    };
     let shape = super::SiteShape::of(&crate::assessment::CpuForm::of(&plan.binding(index)?, form))?;
     let storage = SiteStorage {
         table: sited.table.clone(),

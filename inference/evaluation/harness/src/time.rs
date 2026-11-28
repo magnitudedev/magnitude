@@ -1473,6 +1473,7 @@ fn measure(
             "slots": costs.slots,
             "records": costs.records,
             "layer_groups": costs.layer_groups,
+            "layer_stacks": costs.layer_stacks,
             "experts": costs.experts,
             "held": held,
             // Each group's records a prompt group holds claimed and the
@@ -1502,6 +1503,7 @@ fn selections_digest(selected: &[u8], steps: usize, sequences: usize) -> String 
 struct BankShape {
     records: Vec<usize>,
     layers: Vec<usize>,
+    stacks: Vec<usize>,
     experts: usize,
     held: Vec<Vec<usize>>,
 }
@@ -1511,9 +1513,16 @@ impl BankShape {
         fn field<T: serde::de::DeserializeOwned>(bank: &Value, name: &str) -> Result<T, String> {
             serde_json::from_value(bank[name].clone()).map_err(|error| format!("the bank's {name}: {error}"))
         }
+        let layers: Vec<usize> = field(bank, "layer_groups")?;
+        let stacks: Vec<usize> = match bank.get("layer_stacks") {
+            Some(v) if !v.is_null() => serde_json::from_value(v.clone())
+                .map_err(|error| format!("the bank's layer_stacks: {error}"))?,
+            _ => (0..layers.len()).collect(),
+        };
         Ok(Self {
             records: field(bank, "records")?,
-            layers: field(bank, "layer_groups")?,
+            layers,
+            stacks,
             experts: field(bank, "experts")?,
             held: field(bank, "held")?,
         })
@@ -2039,7 +2048,7 @@ fn streamed_bar(
     use magnitude_executor::{EvictionRecency, replay_routing};
     let detail = &cell["detail"];
     let bank = &detail["expert_bank"];
-    let BankShape { records, layers, experts, held } = BankShape::of(bank)?;
+    let BankShape { records, layers, stacks, experts, held } = BankShape::of(bank)?;
     let read = served_line(detail)?;
     let unified = inputs.lines.iter().all(|lines| lines.host.memory.is_none());
     // A unified bank's records are read raw at the storage device's peak; a
@@ -2087,8 +2096,29 @@ fn streamed_bar(
     // like the rest, since they are what these steps could reach. Bélády
     // within the window is exact without the reads past
     // it, which no miss the window counts depends on.
+    // Map logical layers onto their physical expert stacks for directory replay
+    // (identity on non-looped models; deduplicates shared physical stacks on
+    // looped-core models so Pass 2/3 visits hit the same physical bank stack).
+    let num_stacks = stacks.iter().copied().max().map_or(0, |m| m + 1);
+    let mut stack_groups = vec![0usize; num_stacks];
+    let mut stack_held = vec![Vec::new(); num_stacks];
+    let mut seen_stack = vec![false; num_stacks];
+    for (layer, &stack) in stacks.iter().enumerate() {
+        if !seen_stack[stack] {
+            seen_stack[stack] = true;
+            stack_groups[stack] = layers[layer];
+            stack_held[stack] = held[layer].clone();
+        }
+    }
+    let stack_reads: Vec<magnitude_executor::RoutedRead> = reads
+        .iter()
+        .map(|r| magnitude_executor::RoutedRead {
+            layer: stacks[r.layer],
+            ..r.clone()
+        })
+        .collect();
     let replayed = |recency| -> Result<Vec<Vec<OracleLayer>>, Unjudged> {
-        let replayed = replay_routing(&records, &layers, experts, &held, &reads, recency)?;
+        let replayed = replay_routing(&records, &stack_groups, experts, &stack_held, &stack_reads, recency)?;
         Ok(reads[first..]
             .chunks(layers.len())
             .zip(replayed.misses[first..].chunks(layers.len()))
@@ -2120,7 +2150,7 @@ fn streamed_bar(
     let actual_misses = per_layer(&|layer| live.iter().map(|step| step[layer]).sum::<u64>() as f64 / window);
     // Of Bélády's misses a step, the compulsory ones ([`compulsory_reads`]):
     // what no bank of these records avoids in this window, the rest capacity.
-    let compulsory = compulsory_reads(&held, &reads)[first..].iter().sum::<u64>() as f64 / window;
+    let compulsory = compulsory_reads(&stack_held, &stack_reads)[first..].iter().sum::<u64>() as f64 / window;
     let belady = oracle_misses.iter().sum::<f64>();
     let window_state = json!({ "compulsory_per_step": compulsory, "capacity_per_step": belady - compulsory });
     // On unified memory the frontier hints every layer but the token's
@@ -2158,7 +2188,7 @@ fn streamed_bar(
         None => owned.iter().map(|(_, bytes)| bytes).sum::<u64>() - tier,
     };
     let capacity = crate::bar::records_at_cap(&records, &group_bytes, device.saturating_sub(every_step));
-    let at_cap = replay_routing(&capacity, &layers, experts, &held, &reads, EvictionRecency::NextRead)?;
+    let at_cap = replay_routing(&capacity, &stack_groups, experts, &stack_held, &stack_reads, EvictionRecency::NextRead)?;
     let record_bytes = inputs.lines.iter().map(|lines| lines.host.record_bytes).collect::<Vec<_>>();
     let moved_byte = match unified {
         true => sustained,

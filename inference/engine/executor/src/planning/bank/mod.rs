@@ -86,11 +86,17 @@ pub struct BankGroup {
     pub layers: NonEmpty<usize>,
 }
 
-/// A routed layer whose experts the bank holds.
+/// A routed layer whose experts the bank holds (one visit in decoder order).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BankLayer {
     pub scope: WeightScope,
     pub group: usize,
+    /// The physical expert weight stack (`0..num_stacks`) this visit reads.
+    /// Distinct visits referencing the same physical expert weight descriptors
+    /// (same `WeightStorageIdentity` across all routed tensors) share one
+    /// `physical_stack`, while keeping distinct monotonic `visit_layer`
+    /// indices in `ExpertBankPlan::layers()`.
+    pub physical_stack: usize,
     /// `E`: its experts, its slot map's extent and its home records' count.
     pub experts: u64,
     /// `K`: the experts a row selects in this layer.
@@ -330,23 +336,75 @@ pub enum LayerSite {
 
 /// A bank's streamed routed layers, in decoder order: at least one, each of
 /// at least one expert, so the most any has is positive ([`Self::widest`]).
+/// Multiple visit layers may share one `physical_stack` (`0..num_stacks`),
+/// validated dense and consistent in group and expert count by construction.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BankLayers {
     layers: Vec<BankLayer>,
+    /// Representative (first) visit index for each physical stack `0..num_stacks`.
+    stacks: Vec<usize>,
+    /// Last visit index in decoder order for each physical stack `0..num_stacks`.
+    last_visits: Vec<usize>,
+    /// For each visit `0..layers.len()`, the next visit sharing the same
+    /// `physical_stack`, if any.
+    next_visit: Vec<Option<usize>>,
     widest: NonZeroU64,
 }
 
 impl BankLayers {
-    /// `layers`, where there is one and each has experts.
+    /// `layers`, where there is one, each has experts, and `physical_stack`
+    /// indices are dense `0..num_stacks` with shared stacks agreeing on group
+    /// and expert count.
     pub fn new(layers: Vec<BankLayer>) -> Option<Self> {
         let widest = layers.iter().map(|layer| NonZeroU64::new(layer.experts)).collect::<Option<Vec<_>>>()?;
         let widest = widest.into_iter().max()?;
-        Some(Self { layers, widest })
+        let num_stacks = layers.iter().map(|layer| layer.physical_stack).max()? + 1;
+        let mut stacks: Vec<Option<usize>> = vec![None; num_stacks];
+        let mut last_visits = vec![0usize; num_stacks];
+        let mut next_visit = vec![None; layers.len()];
+        for (visit, layer) in layers.iter().enumerate() {
+            let stack = layer.physical_stack;
+            match stacks[stack] {
+                None => {
+                    stacks[stack] = Some(visit);
+                    last_visits[stack] = visit;
+                }
+                Some(rep) => {
+                    if layers[rep].group != layer.group || layers[rep].experts != layer.experts {
+                        return None;
+                    }
+                    next_visit[last_visits[stack]] = Some(visit);
+                    last_visits[stack] = visit;
+                }
+            }
+        }
+        let stacks = stacks.into_iter().collect::<Option<Vec<_>>>()?;
+        Some(Self { layers, stacks, last_visits, next_visit, widest })
     }
 
     /// The most experts of any of the layers.
     pub fn widest(&self) -> NonZeroU64 {
         self.widest
+    }
+
+    /// Number of distinct physical expert stacks (`<= self.len()`).
+    pub fn num_stacks(&self) -> usize {
+        self.stacks.len()
+    }
+
+    /// Representative (first) visit index for each physical stack `0..num_stacks`.
+    pub fn stack_representatives(&self) -> &[usize] {
+        &self.stacks
+    }
+
+    /// Last visit index in decoder order for each physical stack `0..num_stacks`.
+    pub fn last_visits(&self) -> &[usize] {
+        &self.last_visits
+    }
+
+    /// The next visit index sharing the same `physical_stack` as `visit`, if any.
+    pub fn next_visit_of(&self, visit: usize) -> Option<usize> {
+        self.next_visit[visit]
     }
 }
 
@@ -503,19 +561,18 @@ impl ExpertBankPlan {
 }
 
 impl ExpertBankPlan {
-    /// Where each streamed layer's expert stacks are stored in `artifact`,
-    /// in decoder order, one of each routed tensor of its record: the file,
-    /// and where every expert's record lies in it. A stored tensor holds the
-    /// layer's experts at a fixed pitch, and a stack of a range of each
-    /// one's rows (`ImportTransform::Rows`, admitted by `record_tensor`)
-    /// reads them from the range's first row.
+    /// Where each physical expert stack is stored in `artifact`, in
+    /// physical-stack order (`0..num_stacks`), one of each routed tensor of
+    /// its record: the file, and where every expert's record lies in it. A
+    /// stored tensor holds the stack's experts at a fixed pitch, and a stack
+    /// of a range of each one's rows (`ImportTransform::Rows`, admitted by
+    /// `record_tensor`) reads them from the range's first row.
     pub fn stored_stacks(
         &self,
         artifact: &magnitude_artifacts::gguf::GgufArtifact,
         draft: Option<&magnitude_artifacts::gguf::GgufArtifact>,
     ) -> Result<Vec<RecordTensors<StoredStack>>, String> {
-        self.layers()
-            .iter()
+        self.stacks()
             .map(|layer| {
                 let source_artifact = match layer.scope {
                     WeightScope::DraftSublayer(_) => {
@@ -547,9 +604,13 @@ impl ExpertBankPlan {
                             if bytes % layer.experts != 0 {
                                 return Err(format!("{name:?} stores {bytes} bytes, not {} experts", layer.experts));
                             }
-                            let first = start
-                                .checked_mul(record_bytes / tensor.matrix[0])
+                            let scaled = start
+                                .checked_mul(record_bytes)
                                 .ok_or_else(|| format!("{name:?}: its first row's offset overflows"))?;
+                            if scaled % tensor.matrix[0] != 0 {
+                                return Err(format!("{name:?}: its first row does not align with part bytes"));
+                            }
+                            let first = scaled / tensor.matrix[0];
                             let pitch = bytes / layer.experts;
                             if first.checked_add(record_bytes).is_none_or(|end| end > pitch) {
                                 return Err(format!("{name:?}: its rows lie past each stored expert"));
@@ -697,9 +758,13 @@ impl ExpertBankPlan {
         self.records(group) + self.decode_stage_slots()
     }
 
-    /// Each member layer of group `group`, in its order.
+    /// Each distinct physical stack of group `group`, in its order.
     pub(super) fn member_layers(&self, group: usize) -> impl Iterator<Item = &BankLayer> + '_ {
-        self.groups()[group].layers.iter().map(|&layer| &self.layers()[layer])
+        self.layers()
+            .stack_representatives()
+            .iter()
+            .map(|&rep| &self.layers()[rep])
+            .filter(move |layer| layer.group == group)
     }
 
     /// The experts of each of group `group`'s layers, in its order.
@@ -1252,12 +1317,54 @@ impl ExpertBankPlan {
                 .all(|layer| self.layer_vram_slots(layer, slots) >= layer.experts)
     }
 
+    /// Number of distinct physical expert stacks (`0..num_stacks`).
+    pub fn num_stacks(&self) -> usize {
+        self.layers().num_stacks()
+    }
+
+    /// Physical expert stack index for visit layer `visit`.
+    pub fn stack_of(&self, visit: usize) -> usize {
+        self.layers()[visit].physical_stack
+    }
+
+    /// Representative (first) visit index for physical stack `stack`.
+    pub fn stack_representative(&self, stack: usize) -> usize {
+        self.layers().stack_representatives()[stack]
+    }
+
+    /// Last visit index in decoder order for physical stack `stack`.
+    pub fn stack_last_visit(&self, stack: usize) -> usize {
+        self.layers().last_visits()[stack]
+    }
+
+    /// Next visit index sharing the same physical stack as `visit`, if any.
+    pub fn next_visit_of(&self, visit: usize) -> Option<usize> {
+        self.layers().next_visit_of(visit)
+    }
+
+    /// Representative `BankLayer` for each distinct physical stack, in
+    /// physical-stack order (`0..num_stacks`).
+    pub fn stacks(&self) -> impl Iterator<Item = &BankLayer> + '_ {
+        self.layers().stack_representatives().iter().map(|&rep| &self.layers()[rep])
+    }
+
+    /// Resident byte footprint of one expert record in `group`.
+    pub fn group_record_bytes(&self, group: usize) -> Result<u64, String> {
+        Self::record_sum(&self.groups()[group].record, RecordTensor::record_bytes)
+    }
+
+    /// Resident byte footprint of one expert record for each physical stack
+    /// (`0..num_stacks`), used to normalize pooled eviction by hits-per-byte.
+    pub fn stack_record_bytes(&self) -> Result<Vec<u64>, String> {
+        self.stacks().map(|layer| self.group_record_bytes(layer.group)).collect()
+    }
+
     /// The stored bytes of the experts neither the bank's slots nor its
     /// disjoint host tier's host slots hold, each as its model file stores it:
     /// what the plan's misses read from the file. None of a whole bank.
     pub fn unheld_bytes(&self) -> Result<u64, String> {
         let overflow = || "unheld expert bytes overflow".to_owned();
-        self.layers().iter().try_fold(0u64, |total, layer| {
+        self.stacks().try_fold(0u64, |total, layer| {
             let expert = self.groups()[layer.group]
                 .record
                 .iter()
@@ -1274,7 +1381,7 @@ impl ExpertBankPlan {
     /// without a tier.
     pub fn host_only_bytes(&self) -> Result<u64, String> {
         let overflow = || "host tier expert bytes overflow".to_owned();
-        self.layers().iter().try_fold(0u64, |total, layer| {
+        self.stacks().try_fold(0u64, |total, layer| {
             let expert = self.groups()[layer.group]
                 .record
                 .iter()
@@ -1289,30 +1396,37 @@ impl ExpertBankPlan {
         self.whole_at(self.ceiling)
     }
 
-    /// Group `group`'s experts: every member layer's, its map's extent
+    /// Group `group`'s experts: every member stack's, its map's extent
     /// (`BankPart::Map`).
     pub fn group_experts(&self, group: usize) -> u64 {
-        self.groups()[group].layers.iter().map(|&member| self.layers()[member].experts).sum()
+        self.member_experts(group).sum()
     }
 
-    /// The home record of expert 0 of streamed layer `layer` in its group
+    /// The home record of expert 0 of physical stack `stack` in its group
     /// ([`layer_homes`]); the same word of the group's map (`BankPart::Map`)
-    /// is the layer's expert 0's.
-    pub fn home(&self, layer: usize) -> u64 {
-        layer_homes(self.layers().iter().map(|layer| (layer.group, layer.experts)))[layer]
+    /// is the stack's expert 0's.
+    pub fn stack_home(&self, stack: usize) -> u64 {
+        layer_homes(self.stacks().map(|layer| (layer.group, layer.experts)))[stack]
     }
 
-    /// What one more slot commits at most: a record of every layer. The
-    /// load's weights grow by it up to the granules backing each record
+    /// The home record of expert 0 of streamed visit layer `layer` in its
+    /// group ([`Self::stack_home`]): visits sharing a physical stack map to
+    /// the same home record and slot map slice.
+    pub fn home(&self, layer: usize) -> u64 {
+        self.stack_home(self.stack_of(layer))
+    }
+
+    /// What one more slot commits at most: a record of every physical stack.
+    /// The load's weights grow by it up to the granules backing each record
     /// tensor, less a group's records while it holds its decode request's
     /// ([`Self::records_at`]).
     pub fn slot_bytes(&self) -> Result<u64, String> {
         self.slot_sum(RecordTensor::record_bytes)
     }
 
-    /// `record` of each routed tensor, summed over every layer.
+    /// `record` of each routed tensor, summed over every physical stack.
     fn slot_sum(&self, record: fn(&RecordTensor) -> Result<u64, String>) -> Result<u64, String> {
-        self.layers().iter().try_fold(0u64, |total, layer| {
+        self.stacks().try_fold(0u64, |total, layer| {
             Self::record_sum(&self.groups()[layer.group].record, record).and_then(|bytes| {
                 total
                     .checked_add(bytes)
@@ -1446,7 +1560,8 @@ impl ExpertBankPlan {
     pub fn storage_beyond_records(&self) -> Result<ClaimDemand, String> {
         let mut demand = self.storage_demand()?;
         let mut records = 0u64;
-        for (index, layer) in self.layers().iter().enumerate() {
+        for &index in self.layers().stack_representatives() {
+            let layer = &self.layers()[index];
             let banked = self.banked_bytes(index)?;
             for ((_, plan), (_, bytes)) in layer.resident.iter().zip(banked.iter()) {
                 records = records.checked_add(*bytes).ok_or("banked record bytes overflow")?;

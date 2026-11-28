@@ -32,6 +32,19 @@ pub(crate) fn activation_code(function: ActivationFunction) -> i32 {
     }
 }
 
+/// The feed-forward entries' `activation` code for a [`FeedForwardUp`]:
+/// 3 (SITU) when `GluLimit::Softcap` is active, else [`activation_code`].
+pub(crate) fn activation_code_for(up: &FeedForwardUp) -> i32 {
+    if matches!(
+        up.limit(),
+        Some(magnitude_family_contracts::GluLimit::Softcap { .. })
+    ) {
+        3
+    } else {
+        activation_code(up.activation())
+    }
+}
+
 /// The weights the operator binds, in the order its entries consume them.
 pub(super) fn weights<'a>(dense: &'a DenseFfn, push: &mut WeightPush<'_, 'a>) {
     if let Some(gate) = dense.up.gate() {
@@ -69,7 +82,7 @@ pub(super) fn binding(
     );
     Ok(DenseBinding {
         features: dense.intermediate,
-        function: activation_code(dense.up.activation()),
+        function: activation_code_for(&dense.up),
         limit: dense.up.limit(),
         norm: lookup(WeightKind::InputNorm)?,
         gate: gate.element,

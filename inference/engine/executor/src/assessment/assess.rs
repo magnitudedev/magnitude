@@ -663,7 +663,6 @@ impl BankSlotModel {
     }
 
     fn sum_banked_records(bank: &crate::planning::ExpertBankPlan) -> Result<(u64, Vec<u64>), String> {
-        let mut total = 0u64;
         let mut per_layer = Vec::with_capacity(bank.layers().len());
         for index in 0..bank.layers().len() {
             let banked = bank.banked_bytes(index)?;
@@ -673,10 +672,15 @@ impl BankSlotModel {
                     .checked_add(bytes)
                     .ok_or("banked record bytes overflow")?;
             }
-            total = total
-                .checked_add(layer_sum)
-                .ok_or("banked record bytes overflow")?;
             per_layer.push(layer_sum);
+        }
+        // Physical total deduplicates looped visits sharing one physical stack,
+        // matching `ExpertBankPlan::storage_beyond_records` and `weight_demands`.
+        let mut total = 0u64;
+        for &index in bank.layers().stack_representatives() {
+            total = total
+                .checked_add(per_layer[index])
+                .ok_or("banked record bytes overflow")?;
         }
         Ok((total, per_layer))
     }

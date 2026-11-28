@@ -269,13 +269,12 @@ impl<'a> Tensors<'a> {
             let scale = self.lookup(&grid).ok_or(HeaderError::MissingWeight(grid))?;
             return self.scale_grid(stored, scale).map(Some);
         }
-        if stored.encoding != Encoding::Nvfp4 {
-            return Ok(None);
-        }
         let Some(scale) = self.lookup(&name) else {
             return Ok(None);
         };
-        let input = self.lookup(&format!("{stem}.input_scale"));
+        let input = (stored.encoding == Encoding::Nvfp4)
+            .then(|| self.lookup(&format!("{stem}.input_scale")))
+            .flatten();
         for companion in std::iter::once(scale).chain(input) {
             if companion.encoding != Encoding::F32 || companion.shape != [matrices] {
                 return Err(HeaderError::CompanionScale {

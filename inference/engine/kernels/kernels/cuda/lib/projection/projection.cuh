@@ -222,13 +222,21 @@ template <class E, class Publication = E> struct Glu {
     int function;
     __device__ __forceinline__ float value(float gate, float up) const {
 #if defined(PROJECTION_GLU_LIMIT)
-        const float limit = __uint_as_float(PROJECTION_GLU_LIMIT);
         gate = Act::round(gate);
         up = Act::round(up);
-        gate = gate > limit ? limit : gate;
-        up = up > limit ? limit : up;
-        up = up < -limit ? -limit : up;
-        const float product = Act::round(functions::activate(function, gate)) * up;
+        float product;
+        if (function == functions::situ) {
+            const unsigned bits = static_cast<unsigned>(PROJECTION_GLU_LIMIT);
+            const float gate_cap = __uint_as_float(bits & 0xFFFF0000u);
+            const float up_cap = __uint_as_float((bits & 0x0000FFFFu) << 16u);
+            product = functions::softcap(gate_cap, gate) * functions::sigmoid(gate) * functions::softcap(up_cap, up);
+        } else {
+            const float limit = __uint_as_float(PROJECTION_GLU_LIMIT);
+            gate = gate > limit ? limit : gate;
+            up = up > limit ? limit : up;
+            up = up < -limit ? -limit : up;
+            product = Act::round(functions::activate(function, gate)) * up;
+        }
 #else
         const float product = Act::round(functions::activate(function, Act::round(gate))) * Act::round(up);
 #endif

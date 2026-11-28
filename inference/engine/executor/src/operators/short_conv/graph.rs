@@ -397,6 +397,7 @@ mod tests {
                     convolution: tensor(name("shortconv.conv"), vec![HIDDEN, 3]),
                     output: tensor(name("shortconv.out_proj"), vec![HIDDEN, HIDDEN]),
                 })),
+                post_conv: None,
                 output: if post_norm {
                     OutputForm::PostNorm(rms(tensor(name("post_attention_norm"), vec![HIDDEN])))
                 } else {
@@ -426,6 +427,8 @@ mod tests {
                             )),
                             key_norm: HeadNorm::Rms(rms(tensor(name("attn_k_norm"), vec![64]))),
                             value_norm: ValueNorm::None,
+                            key_conv: None,
+                            value_conv: None,
                             domain: TokenDomain::Token,
                             rounding: RowRounding::None,
                         }),
@@ -441,14 +444,17 @@ mod tests {
                         divisors: None,
                         output: OutputRotary::None,
                     },
+                    relative_bias: None,
                     scale: 1.0 / 8.0,
+                    log_scale: None,
                     media_rows: MediaRowAttention::Causal,
-                    sinks: None,
+                    sinks: magnitude_family_contracts::AttentionSinks::None,
                     output: OutputProjection::Full(tensor(
                         name("attn_output"),
                         vec![HIDDEN, HIDDEN],
                     )),
                 })),
+                post_conv: None,
                 output: OutputForm::Residual,
             }
         };
@@ -466,6 +472,7 @@ mod tests {
                     },
                     down: tensor(name("ffn_down"), vec![HIDDEN, 512]),
                 })),
+                post_conv: None,
                 output: OutputForm::Residual,
             }
         };
@@ -500,18 +507,22 @@ mod tests {
                     latent: None,
                     shared: None,
                 })),
+                post_conv: None,
                 output: OutputForm::Residual,
             }
         };
         let [first_conv, last_conv] = conv;
         let blocks = vec![
             Block {
+                transition: None,
                 sublayers: vec![first_conv, dense],
             },
             Block {
+                transition: None,
                 sublayers: vec![attention, routed(1)],
             },
             Block {
+                transition: None,
                 sublayers: vec![last_conv, routed(2)],
             },
         ];
@@ -541,6 +552,7 @@ mod tests {
                 exit: ExitForm {
                     norm: ExitNorm::Rms(rms(output_norm)),
                     output: embedding,
+                    unpadded_vocabulary: None,
                     softcap: None,
                 },
             },

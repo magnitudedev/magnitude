@@ -267,6 +267,10 @@ pub(super) struct BankRecords {
     /// Bumped as any expert comes to be held or leaves: what each layer
     /// holds changed since a reader last saw it ([`Self::holdings`]).
     holdings: u64,
+    /// Last visit layer in execution order for each physical stack (`0..layers.len()`).
+    /// Unmap safety (`Steps::served`) checks this visit layer so a record is
+    /// never freed while a later visit of the same physical stack may still read it.
+    last_visits: Vec<usize>,
 }
 
 /// Exact bank records acquired by the active prompt group's scratch lease.
@@ -328,7 +332,20 @@ impl BankRecords {
             stage_rings,
             active_lease: None,
             holdings: 0,
+            last_visits: (0..layers.len()).collect(),
         }
+    }
+
+    /// Set the last visit layer in execution order for each physical stack.
+    pub fn with_last_visits(mut self, last_visits: Vec<usize>) -> Self {
+        assert_eq!(last_visits.len(), self.layers.len(), "each physical stack has its last visit");
+        self.last_visits = last_visits;
+        self
+    }
+
+    /// Last visit layer in execution order for physical stack `stack`.
+    pub fn last_visit(&self, stack: usize) -> usize {
+        self.last_visits[stack]
     }
 
     /// Each layer's map, beside a host tier.
@@ -864,7 +881,7 @@ impl BankRecords {
             let Record::Releasing { layer, from, until, back } = self.groups[group].contents[record] else {
                 panic!("record {record} of group {group} is listed releasing");
             };
-            if back.is_none() && steps.served(from, until, layer, progress) {
+            if back.is_none() && steps.served(from, until, self.last_visits[layer], progress) {
                 match slot_reuse(group, record) {
                     super::transport::SlotReuse::Reusable => drained_free.push((group, record)),
                     super::transport::SlotReuse::Quarantined => drained_quarantined.push((group, record)),

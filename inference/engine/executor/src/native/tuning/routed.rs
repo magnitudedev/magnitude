@@ -98,6 +98,12 @@ pub(crate) fn grouped_pass_points(limits: TuningLimits) -> Vec<PointShape> {
 /// starves 86% of experts to `<= 32` rows (median 6) while keeping the top
 /// experts L2-resident, inverting `BM=64, INT8=1` vs `BM=32, INT8=0`.
 pub(crate) fn routes(rows: u64, shape: RoutedShape) -> Vec<i32> {
+    assert!(
+        shape.experts >= shape.selected,
+        "invariant violated: tuning routes() needs at least {} distinct experts per row, got {}",
+        shape.selected,
+        shape.experts
+    );
     let experts = shape.experts as usize;
     let stride = [101, 103, 107]
         .into_iter()
@@ -1834,4 +1840,39 @@ impl EntryTuning for RoutedCombineTuning {
     }
 
     generated_entry!(routed_combine, this => this.elements());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shape(experts: u64, selected: u64) -> RoutedShape {
+        RoutedShape {
+            hidden: 64,
+            features: 64,
+            shared: 0,
+            experts,
+            selected,
+        }
+    }
+
+    #[test]
+    fn routes_draws_distinct_experts_per_row_at_minimum_experts() {
+        let picked = routes(16, shape(8, 8));
+        assert_eq!(picked.len(), 16 * 8);
+        for row in picked.chunks_exact(8) {
+            let mut seen = [false; 8];
+            for &expert in row {
+                let idx = usize::try_from(expert).expect("non-negative expert");
+                assert!(idx < 8, "expert {idx} out of range");
+                assert!(!std::mem::replace(&mut seen[idx], true), "duplicate expert {idx} in row {row:?}");
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "invariant violated")]
+    fn routes_panics_when_experts_below_selected() {
+        let _ = routes(4, shape(2, 8));
+    }
 }

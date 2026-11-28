@@ -1731,7 +1731,7 @@ fn head_topology<'a, G: GraphDraft + 'a>(
 ) -> Result<Projected<G>, GraphError> {
     let (hidden, norm) = (&final_rows.hidden, &final_rows.norm);
     let epsilon = Argument::from(readout_epsilon(geometry)?);
-    let vocabulary = Dim::from(geometry.vocabulary);
+    let vocabulary = Dim::from(geometry.active_vocabulary());
     let width = Dim::from(geometry.hidden);
     let (rows_dim, projected, selected) = (
         Dim::from(class.rows),
@@ -1895,6 +1895,7 @@ fn head_topology<'a, G: GraphDraft + 'a>(
 pub(crate) fn readout_epsilon(geometry: &Decoder) -> Result<f32, String> {
     match &geometry.exit.norm {
         ExitNorm::Rms(norm) => Ok(norm.epsilon as f32),
+        ExitNorm::BlockAttention { norm, .. } => Ok(norm.epsilon as f32),
         // A low-rank exit site mixes the streams in the last block with its
         // norm, and the readout sums its partials and normalizes nothing; a
         // Sinkhorn exit's collapse the readout normalizes by the exit norm.

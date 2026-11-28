@@ -235,6 +235,9 @@ impl ExpertBank {
     ) -> Result<(), String> {
         let homes = self.homes.as_ref().ok_or("a whole bank's import beside no home records")?;
         for (index, (layer, homes)) in self.plan.layers().iter().zip(homes).enumerate() {
+            if index != self.plan.stack_representative(layer.physical_stack) {
+                continue;
+            }
             let first = self.plan.home(index);
             for ((kind, home), (_, resident)) in homes.iter().zip(layer.resident.iter()) {
                 let region = self
@@ -526,13 +529,14 @@ impl ExpertBank {
                 charge(identity(store)?, bytes);
             }
         }
-        // Each layer's experts the bank holds and those its host tier holds
-        // alone, as the watcher published them together: the rest only the
-        // file holds.
+        // Each physical stack's experts the bank holds and those its host tier
+        // holds alone, as the watcher published them together: the rest only
+        // the file holds. Count each physical stack once.
         let (held, alone) = self.watcher.shared().holdings();
         let mut disk_bytes = 0u64;
-        for ((layer, &held), &alone) in self.plan.layers().iter().zip(&held).zip(&alone) {
-            disk_bytes += (layer.experts - held as u64 - alone as u64) * self.stored_bytes_of(layer.group)?;
+        for &rep in self.plan.layers().stack_representatives() {
+            let layer = &self.plan.layers()[rep];
+            disk_bytes += (layer.experts - held[rep] as u64 - alone[rep] as u64) * self.stored_bytes_of(layer.group)?;
         }
         Ok(ExpertResidency {
             experts: self.plan.widest(),
@@ -699,7 +703,9 @@ impl ExpertBank {
     /// `role`.
     pub fn expert_scale(&self, role: WeightRole) -> Result<&Tensor, String> {
         let kind = RoutedTensor::of(role.kind).ok_or_else(|| format!("{role:?} is no routed tensor of a record"))?;
-        self.layout.layers[self.layer(role.scope)?.0]
+        let index = self.layer(role.scope)?.0;
+        let rep = self.plan.stack_representative(self.plan.stack_of(index));
+        self.layout.layers[rep]
             .expert_scales
             .get(kind)
             .and_then(Option::as_ref)
@@ -824,7 +830,13 @@ impl ExpertBank {
             BankPart::Resident => &self.layer_residents[index],
             BankPart::SlotMap => &self.slot_maps[index],
             BankPart::Map => &group.map,
-            BankPart::TierMap => layer.tier.as_ref().ok_or_else(|| format!("bank part {part:?} of a bank without a host tier"))?,
+            BankPart::TierMap => {
+                let rep = self.plan.stack_representative(self.plan.stack_of(index));
+                self.layout.layers[rep]
+                    .tier
+                    .as_ref()
+                    .ok_or_else(|| format!("bank part {part:?} of a bank without a host tier"))?
+            }
             BankPart::Tier { kind } => self
                 .layout
                 .host

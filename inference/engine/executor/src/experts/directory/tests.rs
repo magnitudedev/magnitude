@@ -3699,6 +3699,212 @@ fn finish_demand_landings_batch_swaps_hot_miss_with_cold_held_at_and_below_free_
     assert_eq!(directory.bank_free_count(0), 3, "unpromoted cold miss 50 returned its slot to Free (2 -> 3)");
 }
 
+/// A shared physical stack visited at `visit 0` and `visit 2` (`last_visit = 2`)
+/// must:
+/// 1. Map a demand landing at `visit 0` of step `q` from step `q`
+///    (`park.unresolved(last_visit = 2) == q`) so `visit 2` of the same step
+///    resolves it as a hit without a redundant miss.
+/// 2. Keep a graced record unfreed while step `q` is between `visit 0` and
+///    `visit 2` (`Point::whole(q, 1, q)`), and free it only once the device
+///    passes `last_visit = 2` (`Point::whole(q, 3, q)`).
+#[test]
+fn shared_physical_stack_preserves_unmap_safety_until_last_visit() {
+    let steps = std::sync::Arc::new(self::steps());
+    let map = |experts: u64| {
+        let m = StampedMap::new(cpu_words(&[experts, magnitude_kernels::constants::MAP_WORDS], 0));
+        let v = m.view().clone();
+        (m, v)
+    };
+    let (map0, view0) = map(8);
+    let (map1, _view1) = map(8);
+    let host = HostTier {
+        records: vec![2],
+        lent: vec![0],
+        reserve: 2,
+        placement: Placement::Bank {
+            landing_maps: vec![
+                LandingMap::Bank { map: std::sync::Arc::new(map0), steps: steps.clone() },
+                LandingMap::Bank { map: std::sync::Arc::new(map1), steps: steps.clone() },
+            ],
+        },
+    };
+    // 2 physical stacks (0, 1) unrolled to 4 visits: visits (0, 2) -> stack 0, visits (1, 3) -> stack 1.
+    let mut directory = Directory::new_with_stacks(&[0], &[0, 0], &[8, 8], &[2, 3], &[1, 1], host);
+    steps.begin_through(1);
+
+    // Demand miss at visit 0 of step 1 (4 visits total).
+    let park = steps.park(Point::whole(1, 0, 1), 4);
+    let Claim::Taken(grant) = directory.claim_demand((0, 5), Demand::Lacked, &[], &park) else {
+        panic!("ready record expected for demand claim");
+    };
+    let rec = grant.record();
+    grant.map();
+    directory.landed(0, HostRecord(rec), 5, Some(1));
+
+    // Same step 1 at visit 2 must resolve expert 5 as a hit immediately!
+    assert_eq!(view0.resolve(5, 1), Some(rec as usize), "visit 2 of step 1 hits demand landing from visit 0");
+
+    // Unmap expert 5 for step 2+ (grace holds [1, 2)).
+    let victims = directory.refill_victims(false);
+    steps.unbegun(|at| directory.refill(victims, at));
+    assert_eq!(directory.host(0).graced(), 1);
+
+    // Step 1 at visit 1 (past visit 0, BEFORE visit 2): record MUST NOT be freed yet!
+    directory.retire(Point::whole(1, 1, 1), |_, _| 0, |_| Ending::Running, &steps);
+    assert_eq!(directory.host(0).graced(), 1, "record stays graced while step 1 has not passed last_visit = 2");
+
+    // Step 1 at visit 3 (past last_visit = 2): record is now safe to free!
+    directory.retire(Point::whole(1, 3, 1), |_, _| 0, |_| Ending::Running, &steps);
+    assert_eq!(directory.host(0).graced(), 0, "record frees once step 1 passes last_visit = 2");
+}
+
+/// A shared physical stack visited at `visit 0` and `visit 2` (`last_visit = 2`)
+/// on a `Placer::Tier` bank must:
+/// 1. Publish a promotion (`Directory::promoted`) completing between `visit 0`
+///    and `visit 2` (`progress = Point::whole(1, 1, 1)`) from step 1 so
+///    `visit 2` of step 1 resolves it as a hit immediately.
+/// 2. Refuse to recycle (`Directory::reclaim_served_demand_landings`) a held
+///    record of stack 0 while step 1 has only passed `visit 0` and has NOT yet
+///    passed `last_visit = 2` (delayed device completion), and recycle it once
+///    progress passes `last_visit = 2`.
+#[test]
+fn shared_physical_stack_promotion_and_recycle_respect_last_visit() {
+    let steps = std::sync::Arc::new(self::steps());
+    let map = |experts: u64| {
+        let m = StampedMap::new(cpu_words(&[experts, magnitude_kernels::constants::MAP_WORDS], 0));
+        let v = m.view().clone();
+        (m, v)
+    };
+    let (bank_map0, bank_view0) = map(8);
+    let (bank_map1, _bank_view1) = map(8);
+    let tier_words = || cpu_words(&[8, 1], -1);
+    let host = HostTier {
+        records: vec![4],
+        lent: vec![0],
+        reserve: 0,
+        placement: Placement::Tier {
+            bank_maps: vec![bank_map0, bank_map1],
+            tier_maps: vec![
+                LandingMap::Tier(tier_words()),
+                LandingMap::Tier(tier_words()),
+            ],
+            lent: (0, 0),
+            stage_slots: vec![0],
+        },
+    };
+    // 2 physical stacks (0, 1) unrolled to 4 visits: visits (0, 2) -> stack 0, visits (1, 3) -> stack 1.
+    let mut directory = Directory::new_with_stacks(&[2], &[0, 0], &[8, 8], &[2, 3], &[1, 1], host);
+    directory.price_copies(0, Some(0.0));
+    directory.price_copies(1, Some(0.0));
+
+    // Seed host tier with stack 0 expert 5 and log a decode read so Reuse wants it.
+    let Claim::Taken(grant) = directory.claim_landing(0, 5, 0, Taking::Out, (|_, _| (), |_, _| true)) else {
+        panic!("tier claim expected");
+    };
+    let tier_rec = HostRecord(grant.record());
+    grant.map();
+    directory.landed(0, tier_rec, 5, Some(1));
+    log(&directory, 1, 0, &[5]);
+
+    steps.begin_through(1);
+    let wants = steps.unbegun(|at| directory.promotions(at, 4));
+    assert_eq!(wants.promotions.len(), 1, "expert 5 promoted into bank");
+    let promo = wants.promotions[0];
+    let held_tier = directory.hold_tier(0, 5).expect("tier holds expert 5");
+    directory.copy(promo.group, promo.record, held_tier, 1);
+
+    // 1. Promotion completes between visit 0 and visit 2 of step 1 (`progress = (1, visit=1)`):
+    //    must map from step 1 (`unresolved.from(last_visit = 2) == 1`) so visit 2 hits!
+    //    Note: host RAM still holds expert 5 (`Kept::Banked`), so it is eligible
+    //    for zero-writeback reclaim once step 1 passes `last_visit = 2`.
+    let done = directory.promoted(vec![(promo.group, promo.record)], Point::whole(1, 1, 1), &steps);
+    assert_eq!(done, vec![((0, 5), promo.record)]);
+    assert_eq!(
+        bank_view0.resolve(5, 1),
+        Some(promo.record.index()),
+        "promotion between visit 0 and visit 2 must publish from step 1 for visit 2"
+    );
+
+    // 2. Delayed device completion: step 2 begins while step 1 has passed
+    //    `visit 0` (`progress = (step 1, visit 1)`) and has NOT yet passed
+    //    `last_visit = 2`. `unmap_until = park.unresolved(last_visit = 2) = 2`
+    //    leaves step 1 in `[from=1, unmap_until=2)` still unresolved at visit 2,
+    //    so reclaim MUST NOT recycle stack 0's held slot!
+    steps.begin_through(2);
+    let overflows = vec![(0usize, Some((1usize, 0usize)))];
+    let reclaimed_early = steps.unbegun_with_served(Point::whole(2, 0, 2), 4, |at, park, is_served| {
+        directory.reclaim_served_demand_landings(0, &overflows, at, park, Point::whole(1, 1, 1), is_served, |_| true)
+    });
+    assert!(
+        reclaimed_early.is_empty(),
+        "must NOT reclaim stack 0 while step 1 has not passed last_visit = 2"
+    );
+
+    // 3. Once device passes `last_visit = 2` (`progress = (step 1, visit 3)`),
+    //    reclaim safely recycles stack 0's held slot!
+    let reclaimed_after = steps.unbegun_with_served(Point::whole(2, 0, 2), 4, |at, park, is_served| {
+        directory.reclaim_served_demand_landings(0, &overflows, at, park, Point::whole(1, 3, 1), is_served, |_| true)
+    });
+    assert_eq!(
+        reclaimed_after.len(),
+        1,
+        "must reclaim stack 0 once step 1 passes last_visit = 2"
+    );
+}
+
+/// `store_rank`, `claim_ahead`, and `claim_carryover` must compare candidates
+/// and victims in identical footprint-normalized units (charging bytes once),
+/// even when record footprints are large byte counts (e.g., 1 MiB / 2 MiB).
+#[test]
+fn claim_ahead_and_carryover_compare_footprint_normalized_units() {
+    // 2 host records with reserve = 1: 1 Kept victim + 1 Ready reserve record
+    // so `Taking::Ahead` evaluates victim admission (`outranking` / `claim_carryover`).
+    let host = HostTier::replay(vec![2]).reserving(1);
+    let footprints = [1_000_000u64, 2_000_000u64];
+    let mut directory = Directory::new_with_stacks(&[1], &[0, 0], &[8, 8], &[0, 1], &footprints, host);
+    // Warm up history so both stacks have finite positive expected uses.
+    for step in 1..=20 {
+        log(&directory, step, 0, &[0]);
+        log(&directory, step, 1, &[0]);
+        directory.time().lock().moved(0, Tier::COMPUTE);
+        directory.time().lock().moved(0, Tier::HOST);
+    }
+    // Land cold expert (stack 1, expert 7: never read, 2 MB) into the host tier
+    // (1 Kept, 1 Ready == reserve).
+    let Claim::Taken(g) = directory.claim_landing(1, 7, 0, Taking::Out, (|_, _| (), |_, _| true)) else {
+        panic!("initial claim expected");
+    };
+    directory.landed(1, HostRecord(g.record()), 7, Some(1));
+
+    // Hot candidate (stack 0, expert 0, 1 MB) MUST displace cold victim (stack 1, expert 7, 2 MB)
+    // via `claim_ahead` with `keep = 1` (equal to `ready = 1`, forcing victim admission).
+    // Previously broken because `store_rank` was unnormalized while `rank_of` divided by 1_000_000.
+    let Claim::Taken(g2) = directory.claim_ahead(0, 0, 1, Taking::Ahead, 21, 0.9, 0.0) else {
+        panic!("hot 1 MB candidate must displace cold 2 MB victim in claim_ahead");
+    };
+    directory.unlanded(0, HostRecord(g2.record()));
+
+    // Now replace the kept slot with hot (stack 0, expert 0, 1 MB): a never-read 2 MB
+    // carryover candidate with tiny net_benefit = 0.01 MUST NOT displace it
+    // (`keep = 1 == ready`, forcing victim admission; previously broken because
+    // raw net_benefit wasn't divided by footprint).
+    let mut directory2 = Directory::new_with_stacks(&[1], &[0, 0], &[8, 8], &[0, 1], &footprints, HostTier::replay(vec![2]).reserving(1));
+    for step in 1..=20 {
+        log(&directory2, step, 0, &[0]);
+        log(&directory2, step, 1, &[0]);
+        directory2.time().lock().moved(0, Tier::COMPUTE);
+        directory2.time().lock().moved(0, Tier::HOST);
+    }
+    let Claim::Taken(g3) = directory2.claim_landing(0, 0, 0, Taking::Out, (|_, _| (), |_, _| true)) else {
+        panic!("initial claim expected");
+    };
+    directory2.landed(0, HostRecord(g3.record()), 0, Some(20));
+    assert!(
+        matches!(directory2.claim_carryover(1, 6, 1, Taking::Ahead, 0.01, false), Claim::Short),
+        "cold 2 MB carryover with tiny net_benefit must not displace hot 1 MB resident"
+    );
+}
+
 #[test]
 fn claim_carryover_never_evicts_hotter_resident_for_colder_candidate() {
     use crate::experts::host_records::{Claim, Taking};

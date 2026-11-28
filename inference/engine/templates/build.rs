@@ -28,6 +28,7 @@ const SOURCES: &[&str] = &[
     "native/source/common/parsers/gemma4.cpp",
     "native/source/common/parsers/gigachat-v3.cpp",
     "native/source/common/parsers/gpt-oss.cpp",
+    "native/source/common/parsers/inkling2.cpp",
     "native/source/common/parsers/kimi-k2.cpp",
     "native/source/common/parsers/kimi-k3.cpp",
     "native/source/common/parsers/lfm2.cpp",

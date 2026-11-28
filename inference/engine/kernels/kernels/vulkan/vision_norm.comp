@@ -18,9 +18,21 @@ void vision_norm() {
         : row;
     const bool interleave = int(SEISMIC_PARAM_INTERLEAVE) != 0;
     const uint64_t first = uint64_t(cell) * SEISMIC_RESULT_0_STRIDE_0 + (interleave ? member : uint64_t(member) * h);
+    const int centered_code = int(SEISMIC_PARAM_CENTERED);
+    const int activation = int(SEISMIC_PARAM_ACTIVATION);
+    if (centered_code < 0) {
+        Out out_ = out_offset(SEISMIC_RESULT_0_OUT, first);
+        const uint64_t stride = interleave ? uint64_t(g) : 1ul;
+        const uint64_t src = SEISMIC_PTR(SEISMIC_BUFFER_SOURCE) + from * h * 4ul;
+        for (uint i = SEISMIC_THREAD; i < h; i += gl_WorkGroupSize.x) {
+            const float v = element_f32_at(src + uint64_t(i) * 4ul);
+            out_put(out_, uint64_t(i) * stride, activation != 0 ? vision_activate(activation, v) : v);
+        }
+        return;
+    }
     vision_row_norm(SEISMIC_PTR(SEISMIC_BUFFER_SOURCE) + from * h * 4ul,
         out_offset(SEISMIC_RESULT_0_OUT, first), interleave ? uint64_t(g) : 1ul,
         SEISMIC_DIM_NW == 1, SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT), WEIGHT_KIND, SEISMIC_DIM_NB == 1,
-        SEISMIC_PTR(SEISMIC_BUFFER_BIAS), BIAS_KIND, h, int(SEISMIC_PARAM_CENTERED) != 0,
-        element_word_f32(SEISMIC_PARAM_EPSILON), int(SEISMIC_PARAM_ACTIVATION));
+        SEISMIC_PTR(SEISMIC_BUFFER_BIAS), BIAS_KIND, h, centered_code != 0,
+        element_word_f32(SEISMIC_PARAM_EPSILON), activation);
 }

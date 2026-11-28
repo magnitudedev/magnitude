@@ -9,6 +9,7 @@ from magnitude_references.families.deepseek41 import DeepSeek41Reference
 from magnitude_references.families.gemma4 import Gemma4Reference
 from magnitude_references.families.glm5next import Glm5NextReference
 from magnitude_references.families.glm5next_vision import Glm5NextVisionReference
+from magnitude_references.families.inkling2 import Inkling2Reference
 from magnitude_references.families.lfm2 import Lfm2Reference
 from magnitude_references.families.lfm3 import Lfm3Reference
 from magnitude_references.families.llama import LlamaReference
@@ -30,6 +31,7 @@ REFERENCES: dict[str, tuple[str, type[Reference]]] = {
     "muse-glimmer": ("muse", MuseReference),
     "gemma4": ("gemma4", Gemma4Reference),
     "glm5-next": ("glm5next", Glm5NextReference),
+    "inkling2": ("inkling2", Inkling2Reference),
     "nemotron_h_moe": ("nemotron_h", NemotronHReference),
     "qwen35": ("qwen35", Qwen35Reference),
     "qwen35moe": ("qwen35", Qwen35Reference),

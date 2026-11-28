@@ -20,8 +20,20 @@ extern "C" __global__ void vision_norm(SEISMIC_KERNEL_PARAMS) {
     const bool interleave = (int)SEISMIC_PARAM_INTERLEAVE != 0;
     const u64 first = (u64)cell * SEISMIC_RESULT_0_STRIDE_0 + (interleave ? member : (u64)member * h);
     const float *source = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_SOURCE));
+    const int centered_code = (int)SEISMIC_PARAM_CENTERED;
+    const int activation = (int)SEISMIC_PARAM_ACTIVATION;
+    if (centered_code < 0) {
+        auto out = SEISMIC_RESULT_0_OUT.offset(first);
+        const u64 stride = interleave ? g : 1;
+        const float *src = source + (u64)from * h;
+        for (u32 i = threadIdx.x; i < h; i += blockDim.x) {
+            const float v = src[i];
+            out.put((u64)i * stride, activation != 0 ? vision::activate(activation, v) : v);
+        }
+        return;
+    }
     vision::norm<Y, WeightElement, BiasElement, SEISMIC_DIM_NW == 1, SEISMIC_DIM_NB == 1>(
         source + (u64)from * h, SEISMIC_RESULT_0_OUT.offset(first), interleave ? g : 1,
-        SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT), SEISMIC_PTR(SEISMIC_BUFFER_BIAS), h, (int)SEISMIC_PARAM_CENTERED != 0,
-        __uint_as_float((unsigned)SEISMIC_PARAM_EPSILON), (int)SEISMIC_PARAM_ACTIVATION, partials);
+        SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT), SEISMIC_PTR(SEISMIC_BUFFER_BIAS), h, centered_code != 0,
+        __uint_as_float((unsigned)SEISMIC_PARAM_EPSILON), activation, partials);
 }

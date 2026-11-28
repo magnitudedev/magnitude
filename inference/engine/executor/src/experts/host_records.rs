@@ -212,6 +212,8 @@ pub(super) enum Located {
 pub(in crate::experts) struct Grant {
     map: Option<LandingMap>,
     staged: Staged,
+    /// Last visit layer in execution order for `staged.0`'s physical stack.
+    last_visit: usize,
     record: u32,
     from: GrantFrom,
     mapped: std::sync::atomic::AtomicBool,
@@ -244,7 +246,7 @@ impl Grant {
         if let Some(map) = &self.map {
             match self.from {
                 GrantFrom::Parked(from) => map.map_from(self.staged.1, self.record, from.into()),
-                GrantFrom::Reached(reached) => map.map_reached(self.staged.1, self.record, reached, self.staged.0),
+                GrantFrom::Reached(reached) => map.map_reached(self.staged.1, self.record, reached, self.last_visit),
             }
         }
     }
@@ -566,6 +568,8 @@ pub(super) struct HostRecords {
     /// The read path's mirror of where every expert is, whose words of the
     /// group's layers these records alone clear.
     inbound: Arc<InboundTable>,
+    /// Last visit layer in execution order for each physical stack (`0..maps.len()`).
+    last_visits: Vec<usize>,
     /// Per-layer live `POLICY_WHOLE` flags (`Telemetry::whole_flags`), bound on
     /// `Placer::Bank` (the one store): while a layer's flag is set, its kept
     /// home records are never chosen as eviction/refill/demand/seed victims
@@ -630,11 +634,19 @@ impl HostRecords {
             refill_cache_key: None,
             refill_cache_exhausted: false,
             inbound,
+            last_visits: (0..layers).collect(),
             protected_layers: Arc::from([]),
         };
         assert!(lent <= records, "a tier lends {lent} of its {records} records");
         host.grow(0..records, 0);
         host
+    }
+
+    /// Set the last visit layer in execution order for each physical stack.
+    pub fn with_last_visits(mut self, last_visits: Vec<usize>) -> Self {
+        assert_eq!(last_visits.len(), self.maps.len(), "each physical stack has its last visit");
+        self.last_visits = last_visits;
+        self
     }
 
     /// Bind the live per-layer `POLICY_WHOLE` flags (`Telemetry::whole_flags`)
@@ -649,7 +661,7 @@ impl HostRecords {
     fn layer_protected(&self, record: u32) -> bool {
         self.records[record as usize].whole().is_some_and(|whole| {
             self.protected_layers
-                .get(whole.staged.0)
+                .get(self.last_visits[whole.staged.0])
                 .is_some_and(|flag| flag.load(Ordering::Acquire))
         })
     }
@@ -841,15 +853,22 @@ impl HostRecords {
     }
 
     /// Unmap `staged` from its record `record` at `park`, from the first
-    /// step yet to resolve its layer ([`Self::unmap_from`]).
+    /// step yet to resolve its stack's last visit ([`Self::unmap_from`]).
     fn unmap_parked(&self, staged: Staged, record: u32, park: &Park) {
-        self.unmap_from(staged, record, Some(park.unresolved(staged.0).into()));
+        self.unmap_from(staged, record, Some(park.unresolved(self.last_visits[staged.0]).into()));
     }
 
     /// The grant of mapping `staged` to `record` once landed, from step
     /// `from` on where given.
     fn grant(&self, staged: Staged, record: u32, from: GrantFrom) -> Grant {
-        Grant { map: self.maps[staged.0].clone(), staged, record, from, mapped: std::sync::atomic::AtomicBool::new(false) }
+        Grant {
+            map: self.maps[staged.0].clone(),
+            staged,
+            last_visit: self.last_visits[staged.0],
+            record,
+            from,
+            mapped: std::sync::atomic::AtomicBool::new(false),
+        }
     }
 
     /// The records the store holds storage for: every one but the holes.
@@ -1418,7 +1437,7 @@ impl HostRecords {
         }
         .copied()
         .expect("a record taken is ready");
-        let parked = park.map(|park| park.unresolved(staged.0));
+        let parked = park.map(|park| park.unresolved(self.last_visits[staged.0]));
         self.set(record, Host::Landing { staged, answer: park.map(|park| park.point), from: parked.map_or(MapStep::EVERY, MapStep::from), taking });
         let from = match parked {
             Some(from) => GrantFrom::Parked(from),
@@ -1711,8 +1730,7 @@ impl HostRecords {
             if at.lending() && record < self.lent {
                 continue;
             }
-            if immediate && matches!(self.records[record as usize], Host::Kept(_)) {
-                self.unkeep(record);
+            if immediate && matches!(self.records[record as usize], Host::Kept(_) | Host::Answering(_, _)) {
                 if let Some(map) = &self.maps[chosen.0] {
                     map.store_unbegun(chosen.1, None, Some(at));
                 }
@@ -1723,6 +1741,74 @@ impl HostRecords {
             unmapped = true;
         }
         unmapped
+    }
+
+    /// Whether at least one ready record lies past the cut-in pool so a demand
+    /// `claim(_, 0, Taking::Out, _)` can acquire a slot without `Claim::Short`.
+    pub fn has_ready_beyond_pool(&self) -> bool {
+        self.beyond(self.ready.len(), self.pool)
+    }
+
+    /// Immediately release all `Host::Graced` records to `Host::Ready`.
+    /// Valid ONLY under `tier_copy_dma && at.all_scratch()` where zero GPU
+    /// decode kernels read `tier_map` and every active `HostTier` copy pins its
+    /// record with `whole.holds > 0`.
+    pub fn retire_immediate(&mut self) -> bool {
+        if self.graced.is_empty() {
+            return false;
+        }
+        let freed = self.graced.clone();
+        for record in freed {
+            self.set(record, Host::Ready);
+        }
+        true
+    }
+
+    /// Select up to `self.reserve.max(1)` coldest unheld records (never lent
+    /// records while `lending`) to immediately free for active `tier_copy_dma`
+    /// prefill demand when `self.ready.len() <= self.pool`, bypassing
+    /// `file_lacked` and `graced.len()` reserve gating.
+    pub fn reclaim_victims_for_scratch_dma<K: Ord + Copy>(&self, rank: impl Rank<K>, lending: bool) -> Vec<(u32, Staged)> {
+        if self.has_ready_beyond_pool() {
+            return Vec::new();
+        }
+        let need = self.reserve.max(1);
+        let mut order = (0..self.extent())
+            .filter(|&record| (!lending || record >= self.lent) && self.unheld(record) && !self.layer_protected(record))
+            .filter_map(|record| {
+                let (kept, key, staged) = match self.records[record as usize] {
+                    Host::Answering(Whole { staged, kept, read, .. }, _) => taking(kept, staged, read, &rank),
+                    _ => self.place(record, &rank)?,
+                };
+                Some(((kept, key, record >= self.lent, staged), record, staged))
+            })
+            .collect::<Vec<_>>();
+        if need < order.len() {
+            order.select_nth_unstable(need);
+            order.truncate(need);
+        }
+        order.sort_unstable();
+        order.into_iter().map(|(_, record, staged)| (record, staged)).collect()
+    }
+
+    /// Concise diagnostic snapshot for watchdog / SIGUSR1 reports.
+    pub fn describe(&self) -> String {
+        format!(
+            "ready={}(past={}) graced={} kept={} banked={} ans={} land={} claimed={} ext={} lent={} res={} pool={} lacked={}",
+            self.ready.len(),
+            self.ready_past_lent,
+            self.graced.len(),
+            self.kept.len(),
+            self.banked.len(),
+            self.answering.len(),
+            self.landing.len(),
+            self.claimed,
+            self.extent(),
+            self.lent,
+            self.reserve,
+            self.pool,
+            self.lacked(),
+        )
     }
 
     /// Unmap kept record `record`, which no copy holds, from `at`, the
@@ -2025,7 +2111,7 @@ impl HostRecords {
     fn reclaims(&self, record: u32, read: impl Fn(u32) -> bool, park: &Park) -> bool {
         match self.records[record as usize] {
             Host::Kept(Whole { staged, holds: 0, from, .. }) => {
-                !self.layer_protected(record) && !read(record) && park.frees(staged.0, from.step(), Step::MAX)
+                !self.layer_protected(record) && !read(record) && park.frees(self.last_visits[staged.0], from.step(), Step::MAX)
             }
             _ => false,
         }
@@ -2139,7 +2225,7 @@ impl HostRecords {
         self.passed(park.point);
         let resolution = self.resolution;
         self.free(|tier, record, staged, (from, until), answer| {
-            if read(record) || answer.is_some_and(|answer| answer >= park.point) || !park.frees(staged.0, from, until) {
+            if read(record) || answer.is_some_and(|answer| answer >= park.point) || !park.frees(tier.last_visits[staged.0], from, until) {
                 return false;
             }
             if resolution == Resolution::BeforeStamp {
@@ -2156,8 +2242,8 @@ impl HostRecords {
     /// ready.
     pub fn retire(&mut self, progress: Point, steps: &Steps) -> bool {
         self.passed(progress);
-        self.free(|_, _, staged, (from, until), answer| {
-            answer.is_none_or(|answer| answer < progress) && steps.served(from, until, staged.0, progress)
+        self.free(|tier, _, staged, (from, until), answer| {
+            answer.is_none_or(|answer| answer < progress) && steps.served(from, until, tier.last_visits[staged.0], progress)
         })
     }
 

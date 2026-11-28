@@ -210,7 +210,7 @@ pub(crate) fn parallel<'a, G: GraphDraft + 'a>(
                     ("US", up.operands.scale.extent.clone()),
                     ("GB", gate.operands.bound.extent.clone()),
                     ("UB", up.operands.bound.extent.clone()),
-                    ("LB", Dim::from(magnitude_family_contracts::GluLimit::word(expansion.limit))),
+                    ("LB", Dim::from(crate::operators::glu_limit_word(expansion.limit))),
                 ],
             ]
             .concat(),

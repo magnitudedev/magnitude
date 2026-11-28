@@ -4,6 +4,7 @@ pub(crate) mod graph;
 pub(crate) mod invocation_demand;
 pub(crate) mod native_constants;
 pub(crate) mod native_draft;
+pub(crate) mod native_draft_rnn;
 pub(crate) mod native_drafter;
 pub(crate) mod native_head;
 pub(crate) mod native_import;

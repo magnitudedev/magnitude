@@ -36,7 +36,7 @@ use magnitude_family_contracts::{
 };
 use seismic::{Dim, Element};
 
-use super::dense_ffn::activation_code;
+use super::dense_ffn::activation_code_for;
 
 /// An expansion's form, activation code and clamp.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -44,7 +44,7 @@ pub struct Expansion {
     /// Gated (`act(gate) · up`) or up-only (`act(up)`).
     pub gated: bool,
     pub activation: i32,
-    /// The gated expansion's clamp (`glu`'s, its entries' LB).
+    /// The gated expansion's clamp or SITU softcap (`glu`'s, its entries' LB).
     pub limit: Option<GluLimit>,
 }
 
@@ -52,7 +52,7 @@ impl Expansion {
     pub(crate) fn of(up: &FeedForwardUp) -> Self {
         Self {
             gated: up.gate().is_some(),
-            activation: activation_code(up.activation()),
+            activation: activation_code_for(up),
             limit: up.limit(),
         }
     }

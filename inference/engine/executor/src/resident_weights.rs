@@ -62,6 +62,10 @@ impl ResidentRoles {
             .ok_or_else(|| format!("resident weight {role:?} is absent"))
     }
 
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&WeightRole, &ResidentWeight)> {
+        self.0.iter()
+    }
+
     fn values(&self) -> impl Iterator<Item = &ResidentWeight> {
         self.0.values()
     }
@@ -113,7 +117,7 @@ impl ResidentRoles {
                 charges,
                 artifact,
                 descriptor,
-                operators::resident_dtype(role.kind, activation),
+                operators::resident_dtype_for(role.kind, descriptor, activation),
             )?;
             if roles.insert(role, weight).is_some() {
                 return Err(invalid(format!("weight role {role:?} is bound twice")));
@@ -326,14 +330,32 @@ pub(crate) fn import_target(
                 .collect(),
             exit.norm.as_ref().map(|norm| residency.import_gguf(charges, target, &norm.weight, activation)).transpose()?,
         ),
+        ExitNorm::BlockAttention { norm, .. } => (
+            operators::exit_weights(decoder)
+                .into_iter()
+                .filter(|(role, _)| role.kind != magnitude_family_contracts::WeightKind::OutputNorm)
+                .collect(),
+            Some(residency.import_gguf(charges, target, &norm.weight, activation)?),
+        ),
         ExitNorm::Rms(RmsNorm { weight, .. }) | ExitNorm::Layer(LayerNorm { weight, .. }) => (
             Vec::new(),
             Some(residency.import_gguf(charges, target, weight, activation)?),
         ),
     };
+    let entry_roles = match &decoder.entry.norm {
+        Some(magnitude_family_contracts::EntryNorm::Rms { norm, .. }) => vec![(
+            WeightRole {
+                scope: WeightScope::Target,
+                kind: WeightKind::EntryNorm,
+            },
+            &norm.weight,
+        )],
+        _ => Vec::new(),
+    };
     let sublayers = ResidentRoles::import(
-        operators::decoder_weights(decoder)
+        entry_roles
             .into_iter()
+            .chain(operators::decoder_weights(decoder))
             .chain(exit_roles)
             .collect(),
         residency,
@@ -341,8 +363,10 @@ pub(crate) fn import_target(
         target,
         activation,
     )?;
+    let exit_output = operators::exit_output_descriptor(decoder)
+        .map_err(|error| invalid(error.to_string()))?;
     let output = import_output(
-        &decoder.exit.output,
+        exit_output.as_ref(),
         WeightScope::Target,
         target,
         residency,
@@ -356,18 +380,31 @@ pub(crate) fn import_target(
             let artifact = package
                 .draft()
                 .expect("validated: a bound draft has its component");
-            let mut import = |kind, descriptor| {
+            let mut import = |kind, descriptor: &magnitude_family_contracts::WeightDescriptor| {
                 residency.import_gguf(
                     charges,
                     artifact,
                     descriptor,
-                    operators::resident_dtype(kind, activation),
+                    operators::resident_dtype_for(kind, descriptor, activation),
                 )
             };
-            Ok::<_, ResidencyError>(ResidentFusion {
-                projection: import(WeightKind::DraftFusion, &draft.fusion)?,
-                norm: import(WeightKind::DraftFusionNorm, &draft.fusion_norm.weight)?,
-            })
+            match &draft.fusion {
+                magnitude_family_contracts::DraftFusion::Linear { projection, norm } => {
+                    Ok::<_, ResidencyError>(ResidentFusion {
+                        projection: import(WeightKind::DraftFusion, projection)?,
+                        norm: import(WeightKind::DraftFusionNorm, &norm.weight)?,
+                    })
+                }
+                magnitude_family_contracts::DraftFusion::SoftmaxMix { weights, norms } => {
+                    let first_norm = norms
+                        .first()
+                        .ok_or_else(|| invalid("softmax-mix draft fusion has no norms"))?;
+                    Ok::<_, ResidencyError>(ResidentFusion {
+                        projection: import(WeightKind::DraftFusion, weights)?,
+                        norm: import(WeightKind::DraftFusionNorm, &first_norm.weight)?,
+                    })
+                }
+            }
         })
         .transpose()?;
     let per_layer = decoder
@@ -499,8 +536,10 @@ pub(crate) fn import_optional_head(
         .map(|head| {
             let embedding =
                 residency.import_gguf(charges, package.target(), &decoder.entry.embedding, activation)?;
+            let exit_output = operators::exit_output_descriptor(decoder)
+                .map_err(|error| invalid(error.to_string()))?;
             let output = import_output(
-                &decoder.exit.output,
+                exit_output.as_ref(),
                 WeightScope::Target,
                 package.target(),
                 residency,
@@ -575,21 +614,32 @@ fn import_draft(
     };
     let output = match &draft.output {
         Some(output) => import_output(output, WeightScope::Draft, artifact, residency, charges, activation)?,
-        None => import_output(
-            &decoder.exit.output,
-            WeightScope::Target,
-            target,
-            residency,
-            charges,
-            activation,
-        )?,
+        None => {
+            let exit_output = operators::exit_output_descriptor(decoder)
+                .map_err(|error| invalid(error.to_string()))?;
+            import_output(
+                exit_output.as_ref(),
+                WeightScope::Target,
+                target,
+                residency,
+                charges,
+                activation,
+            )?
+        }
     };
     let mut weights =
         operators::draft::draft_weights(draft).map_err(|error| invalid(error.to_string()))?;
     // These are bound as named resident fields, not by role.
     weights.retain(|(role, _)| !matches!(role.kind, WeightKind::Embedding | WeightKind::Output));
-    let [_, fusion_norm] = operators::draft::fusion_weights(draft);
-    weights.push(fusion_norm);
+    // Include fusion weights: `DraftFusion::Linear` runs on the target lane
+    // (skip its projection), whereas `DraftFusion::SoftmaxMix` runs inside
+    // `BoundRnnDraft` and reads `Draft::DraftFusion` from `ResidentHead::weights`.
+    let fusion = operators::draft::fusion_weights(draft);
+    let skip = usize::from(matches!(
+        draft.fusion,
+        magnitude_family_contracts::DraftFusion::Linear { .. }
+    ));
+    weights.extend(fusion.into_iter().skip(skip));
     Ok(ResidentHead {
         embedding,
         depth: draft.blocks.len(),

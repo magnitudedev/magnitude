@@ -700,6 +700,7 @@ impl Geometry {
                 epsilon: self.epsilon,
                 mixing: None,
             })),
+            post_conv: None,
             output: OutputForm::Residual,
         })
     }
@@ -805,6 +806,7 @@ pub fn inspect_components(
                         Operator::RoutedFfn(Box::new(routed)),
                     )?,
                 ],
+                transition: None,
             })
         })
         .collect::<Result<Vec<_>, FamilyError>>()?;
@@ -860,6 +862,7 @@ pub fn inspect_components(
                 }),
                 output,
                 softcap: None,
+                unpadded_vocabulary: None,
             },
         },
         head: None,

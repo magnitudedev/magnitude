@@ -1,0 +1,24 @@
+// message_gate_mix: `(1 - tanh(forget)) * dest + tanh(gain) * msg`, F32.
+#include <seismic/element.glsl>
+#include "lib/core/precise.glsl"
+
+void message_gate_mix() {
+    const uint64_t col = uint64_t(gl_WorkGroupID.x) * uint64_t(gl_WorkGroupSize.x) + uint64_t(gl_LocalInvocationIndex);
+    if (col >= SEISMIC_DIM_H)
+        return;
+    const uint64_t dest = SEISMIC_PTR(SEISMIC_BUFFER_DEST);
+    const uint64_t msg = SEISMIC_PTR(SEISMIC_BUFFER_MSG);
+    const uint64_t gain = SEISMIC_PTR(SEISMIC_BUFFER_GAIN);
+    const uint64_t forget = SEISMIC_PTR(SEISMIC_BUFFER_FORGET);
+    const Out result = SEISMIC_RESULT_0_OUT;
+    for (uint64_t row = uint64_t(gl_WorkGroupID.y); row < SEISMIC_DIM_M; row += uint64_t(gl_NumWorkGroups.y)) {
+        const float d = element_f32_at(dest + (row * SEISMIC_DEST_STRIDE_0 + col * SEISMIC_DEST_STRIDE_1) * 4ul);
+        const float m = element_f32_at(msg + (row * SEISMIC_MSG_STRIDE_0 + col * SEISMIC_MSG_STRIDE_1) * 4ul);
+        const float g = element_f32_at(gain + (row * SEISMIC_GAIN_STRIDE_0 + col * SEISMIC_GAIN_STRIDE_1) * 4ul);
+        const float f = element_f32_at(forget + (row * SEISMIC_FORGET_STRIDE_0 + col * SEISMIC_FORGET_STRIDE_1) * 4ul);
+        const float tf = seismic_div_rn(2.0, 1.0 + precise_exp(-2.0 * f)) - 1.0;
+        const float tg = seismic_div_rn(2.0, 1.0 + precise_exp(-2.0 * g)) - 1.0;
+        out_put(result, row * SEISMIC_RESULT_0_STRIDE_0 + col * SEISMIC_RESULT_0_STRIDE_1,
+            (1.0 - tf) * d + tg * m);
+    }
+}
