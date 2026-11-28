@@ -4,7 +4,7 @@ import { ExploreView } from "./explore-view"
 
 const render = (query: string, results: Parameters<typeof ExploreView>[0]["results"]) => renderToStaticMarkup(
   <ExploreView query={query} setQuery={() => {}} results={results} families={[]} owned={new Set()}
-    download={() => null} useOpened={model => model} onSeen={() => {}} />
+    download={() => null} useOpened={model => model} />
 )
 
 describe("Explore models", () => {
@@ -20,5 +20,17 @@ describe("Explore models", () => {
     const html = render("qwen", { _tag: "Searching" })
     expect(html).toContain("Searching Hugging Face…")
     expect(html).not.toContain("Results from Hugging Face show here")
+  })
+
+  it("shows Checking models while the first batch of checks is settling", () => {
+    const html = render("qwen", { _tag: "Results", rows: [], more: { _tag: "Checking" } })
+    expect(html).toContain("Checking models…")
+    expect(html).not.toContain("No models on Hugging Face")
+  })
+
+  it("offers a manual Check more results button when the first pages had no runnable models", () => {
+    const html = render("phi", { _tag: "Results", rows: [], more: { _tag: "Manual", onMore: () => {} } })
+    expect(html).toContain("No models in the most downloaded Hugging Face results")
+    expect(html).toContain("Check more results")
   })
 })

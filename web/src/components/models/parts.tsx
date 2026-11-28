@@ -1,7 +1,7 @@
 import { useState, type ReactNode } from "react"
 import { Skeleton } from "../ui/skeleton"
 import { ActionTooltip } from "../ui/tooltip"
-import { ArrowSquareOutIcon, CheckIcon, CircleNotchIcon, CubeIcon, DesktopTowerIcon, GraphicsCardIcon, HardDrivesIcon, InfoIcon, LaptopIcon, MemoryIcon, MonitorIcon } from "@phosphor-icons/react"
+import { ArrowSquareOutIcon, CaretDownIcon, CheckIcon, CircleNotchIcon, CubeIcon, DesktopTowerIcon, DownloadSimpleIcon, GraphicsCardIcon, HardDrivesIcon, InfoIcon, LaptopIcon, MemoryIcon, MonitorIcon } from "@phosphor-icons/react"
 import { formatContext, formatMemoryCapacity, formatStorageSize } from "@magnitudedev/client-common"
 import { cn } from "@/lib/utils"
 import { modelLabs, type ModelLab } from "../model-logo"
@@ -10,6 +10,25 @@ import type { MachineView, PlacementTier, QuantView } from "./view"
 export const cardClass = "rounded-xl border border-slate-200 bg-white dark:border-slate-750 dark:bg-slate-850"
 
 export const formatSpeed = (speed: number) => speed < 1 ? "<1 tok/s" : `${Math.round(speed)} tok/s`
+
+export const formatDownloads = (count: number): string => {
+  if (count >= 1_000_000) {
+    const value = count / 1_000_000
+    return `${value >= 100 ? Math.round(value) : value.toFixed(1).replace(/\.0$/, "")}M`
+  }
+  if (count >= 1_000) {
+    const value = count / 1_000
+    return `${value >= 100 ? Math.round(value) : value.toFixed(1).replace(/\.0$/, "")}K`
+  }
+  return `${count}`
+}
+
+export function DownloadsCount({ count }: { count: number }) {
+  return <span title={`${count.toLocaleString()} all-time downloads on Hugging Face`} className="inline-flex items-center gap-0.5 whitespace-nowrap tabular-nums">
+    <DownloadSimpleIcon aria-hidden="true" className="size-3 shrink-0" />
+    {formatDownloads(count)}
+  </span>
+}
 
 export const bitWidthLabel = (bits: number): string | null => bits > 0 ? `${bits}-bit` : null
 
@@ -282,8 +301,9 @@ export function MachineCard({ machine }: { machine: MachineView }) {
 }
 
 /** A selectable model card whose header summarizes the chosen quant and whose body opens in place. */
-export function ModelCardShell({ lab, title, note, detail, quant, active, onSelect, children }: {
-  lab: ModelLab | undefined; title: string; note?: string | undefined; detail: ReactNode; quant: QuantView; active: boolean; onSelect: () => void; children?: ReactNode
+export function ModelCardShell({ lab, title, note, detail, quant, sizeLabel = "on disk", disclosure = "check", active, onSelect, children }: {
+  lab: ModelLab | undefined; title: string; note?: string | undefined; detail: ReactNode; quant: QuantView
+  sizeLabel?: ReactNode; disclosure?: "check" | "chevron"; active: boolean; onSelect: () => void; children?: ReactNode
 }) {
   return <div className={cn("overflow-hidden rounded-xl border bg-white dark:bg-slate-850", active ? "border-blue-600 ring-1 ring-blue-600/30 dark:border-blue-400" : "border-slate-200 hover:border-slate-300 dark:border-slate-750 dark:hover:border-slate-700")}>
     {/* The card opens from a button laid over it, so the repository link in its line is beside the button, not inside it. */}
@@ -292,14 +312,16 @@ export function ModelCardShell({ lab, title, note, detail, quant, active, onSele
       <LabMark lab={lab} className="size-10" />
       <span className="min-w-0">
         <span className="flex items-center gap-2 text-[14px] font-medium"><span className="max-w-full shrink-0 truncate">{title}</span>{note && <span className="min-w-0 truncate text-xs font-normal text-slate-500">{note}</span>}</span>
-        <span className="mt-0.5 block min-w-0 truncate text-xs text-slate-500">{detail}</span>
+        <span className="mt-0.5 flex min-w-0 items-center gap-1.5 truncate text-xs text-slate-500">{detail}</span>
       </span>
       <span className="flex items-center gap-4">
-        <span className="grid grid-cols-[84px_64px] gap-4 text-right">
+        <span className="grid grid-cols-[84px_minmax(64px,120px)] gap-4 text-right">
           <span><span className="block text-[15px] font-medium tabular-nums text-slate-900 dark:text-slate-100">{quant.fits && quant.speed !== null ? `~${formatSpeed(quant.speed)}` : "—"}</span><span className="block whitespace-nowrap text-[11px] text-slate-500">{quant.phrase ?? fitLabel(quant)}</span></span>
-          <span><span className="block text-[15px] font-medium tabular-nums text-slate-900 dark:text-slate-100">{formatStorageSize(quant.sizeBytes)}</span><span className="block text-[11px] text-slate-500">on disk</span></span>
+          <span className="min-w-0"><span className="block text-[15px] font-medium tabular-nums text-slate-900 dark:text-slate-100">{formatStorageSize(quant.sizeBytes)}</span><span className="block truncate whitespace-nowrap text-[11px] text-slate-500">{sizeLabel}</span></span>
         </span>
-        <span className={cn("flex size-5 items-center justify-center rounded-full border", active ? "border-blue-600 bg-blue-600 text-white dark:border-blue-400 dark:bg-blue-400 dark:text-slate-925" : "border-slate-300 dark:border-slate-700")}>{active && <CheckIcon className="size-3" />}</span>
+        {disclosure === "chevron"
+          ? <CaretDownIcon aria-hidden="true" className={cn("size-4 shrink-0 text-slate-400 transition-transform", active && "rotate-180 text-blue-600 dark:text-blue-400")} />
+          : <span className={cn("flex size-5 items-center justify-center rounded-full border", active ? "border-blue-600 bg-blue-600 text-white dark:border-blue-400 dark:bg-blue-400 dark:text-slate-925" : "border-slate-300 dark:border-slate-700")}>{active && <CheckIcon className="size-3" />}</span>}
       </span>
     </div>
     {children}

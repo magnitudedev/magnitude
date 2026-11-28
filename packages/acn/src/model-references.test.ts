@@ -10,6 +10,13 @@ describe("model references", () => {
     expect(parse("unsloth/Qwen3.6-GGUF")).toEqual(Either.right({
       _tag: "HuggingFace", repository: "unsloth/Qwen3.6-GGUF", revision: "main", file: Option.none(), quant: Option.none(),
     }))
+    expect(parse("unsloth/Qwen3.6-GGUF@abc123")).toEqual(Either.right({
+      _tag: "HuggingFace", repository: "unsloth/Qwen3.6-GGUF", revision: "abc123", file: Option.none(), quant: Option.none(),
+    }))
+    expect(parse("unsloth/Qwen3.6-GGUF@abc123:Q4_K_M")).toEqual(Either.right({
+      _tag: "HuggingFace", repository: "unsloth/Qwen3.6-GGUF", revision: "abc123", file: Option.none(), quant: Option.some("Q4_K_M"),
+    }))
+    expect(Either.isLeft(parse("unsloth/Qwen3.6-GGUF@"))).toBe(true)
     expect(parse("unsloth/Qwen3.6-GGUF:Q4_K_M")).toMatchObject(Either.right({ quant: Option.some("Q4_K_M") }))
     expect(parse("z-lab/drafters/sub/dflash.gguf")).toMatchObject(Either.right({ file: Option.some("sub/dflash.gguf") }))
   })

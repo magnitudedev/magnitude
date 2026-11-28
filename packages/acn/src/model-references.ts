@@ -64,11 +64,17 @@ export const parseModelReference = (
   if (quant !== undefined && (quant.length === 0 || quant.includes("/"))) {
     return Either.left("A version is named owner/repository:QUANT")
   }
-  const [owner, name, ...file] = head.split("/")
+  const [owner, rawName, ...file] = head.split("/")
+  const at = rawName?.indexOf("@") ?? -1
+  const name = at >= 0 ? rawName!.slice(0, at) : rawName
+  const revision = at >= 0 ? rawName!.slice(at + 1) : "main"
+  if (at >= 0 && revision.length === 0) {
+    return Either.left("A pinned revision is named owner/repository@revision")
+  }
   return Either.map(repository(owner, name), (id): ModelReference => ({
     _tag: "HuggingFace",
     repository: id,
-    revision: "main",
+    revision,
     file: file.length > 0 ? Option.some(file.join("/")) : Option.none(),
     quant: Option.fromNullable(quant),
   }))

@@ -143,4 +143,53 @@ describe("visibleLadderRungs", () => {
     )
     expect(html).not.toContain("DFlash")
   })
+
+  it("renders Hugging Face repository rows with downloads first, uploader, quant count, no context, and Best label on the right", () => {
+    const q4: QuantView = {
+      key: "hf:unsloth/gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf",
+      bits: 4,
+      publisher: "unsloth",
+      name: "UD-Q4_K_XL",
+      repository: "unsloth/gemma-4-26B-A4B-it-GGUF",
+      sizeBytes: 17.4e9,
+      downloadBytes: 17.4e9,
+      drafterBytes: 0,
+      drafterTarget: null,
+      fits: true,
+      measuring: false,
+      speed: 62,
+      phrase: "Fits in memory",
+      placement: [{ kind: "Unified", bytes: 17.4e9 }],
+      servedContext: 131_072,
+      quality: null,
+      missingDiskBytes: 0,
+    }
+    const offered: OfferedModel = {
+      key: "unsloth/gemma-4-26B-A4B-it-GGUF",
+      catalog: false,
+      name: "Gemma 4 26B A4B It",
+      lab: undefined,
+      country: null,
+      fineTuneOf: null,
+      drafter: null,
+      contextLimit: 131_072,
+      quants: [q4],
+      recommended: q4.key,
+      checking: false,
+      downloads: 16_760_416,
+      uploader: "unsloth",
+      quantCount: 25,
+    }
+    const html = renderToStaticMarkup(
+      <ExpandingModel model={offered} expanded={false} onToggle={() => {}} quantChoice={null} onQuantChoice={() => {}} owned={new Set()} />,
+    )
+    expect(html).toContain("16.8M")
+    expect(html).toContain("unsloth")
+    expect(html).toContain("25 quants")
+    expect(html).toContain("Best: UD-Q4_K_XL")
+    expect(html).not.toContain("4-bit")
+    expect(html).not.toContain("context")
+    expect(html.indexOf("16.8M")).toBeLessThan(html.indexOf("unsloth"))
+    expect(html.indexOf("unsloth")).toBeLessThan(html.indexOf("25 quants"))
+  })
 })
