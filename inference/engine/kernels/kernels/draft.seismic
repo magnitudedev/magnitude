@@ -154,10 +154,17 @@ native readout_project_rows for metal from "metal/readout_project_rows.metal":
 # feature rows and the weight's first S rows, with readout_head_rows' forms;
 # where I is 1 the routed `choice` (`gather_choice`), each feature row an
 # expert over the S rows it selects, read in 16-row tiles of the selection
-# (`projection::Gathered`).
+# (`projection::Gathered`). A row's logit sums its K parts in the order its
+# split sets, so both forms split K alike (KSPLIT, GATHER_KSPLIT): a token's
+# indexed logit is its logit in the vocabulary's columns, bit for bit, on
+# every device and under any tuning. Their defaults alone would split apart:
+# the dense GEMV's never 1 past 256 columns a part, the gathered choice's 1
+# below 1024 columns, each by its own share of the device's units.
 native readout_project_rows for cuda from "cuda/readout_project_rows.cu":
     static (V, D, S, I, WS)
     project dense single (weight) gathered token_rows
+    restate arithmetic KSPLIT in [4] default 4
+    restate arithmetic GATHER_KSPLIT in [4] default 4
     restate arithmetic SPLIT in [1, 2] default 1
 
 # Vulkan: as Metal, where I is 0 the `dense` projection (single) over the
