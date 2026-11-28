@@ -146,16 +146,21 @@ struct Stack {
 }
 
 /// The plan of the role's stack a decode launch of `scope` reads where
-/// `load`'s bank serves it: its first slots (`ExpertBankPlan::slots`), the
-/// records the launch's routes address, whatever the layer's expert count.
-/// None of a stack the load holds whole.
+/// `load`'s bank serves it: its first slots (`ExpertBankPlan::slots`), or at
+/// least `layer.selected` when the bank's elastic floor is below `K` (since
+/// decode kernels require `K` distinct choices per row and `routed::gather`
+/// traps if a record appears more than once in the same row). None of a stack
+/// the load holds whole.
 fn decode_stack(load: &ModelLoadPlan, scope: WeightScope, kind: WeightKind) -> Option<WeightPlan> {
     let bank = load.expert_bank()?;
+    let (_, layer) = bank.layer(scope)?;
     let plan = bank.resident_plan(WeightRole { scope, kind })?;
-    (bank.slots < *plan.shape.first()?).then_some(())?;
+    let whole = *plan.shape.first()?;
+    let slots = bank.slots.max(layer.selected);
+    (slots < whole).then_some(())?;
     // A bank is its stack's first `slots` records, so the stack divides into
     // them: a stack that does not is an invariant violation, never a whole one.
-    Some(plan.leading(bank.slots).expect("a banked stack divides into its bank's slots"))
+    Some(plan.leading(slots).expect("a banked stack divides into its bank's slots"))
 }
 
 /// The experts a decode point's routes draw from, its stacks of `scopes`
