@@ -112,7 +112,6 @@ impl HuggingFaceDiscovery {
             "sha",
             "lastModified",
             "downloads",
-            "downloadsAllTime",
             "likes",
             "tags",
             "private",
@@ -550,8 +549,6 @@ struct HubSearchModel {
     last_modified: Option<String>,
     #[serde(default)]
     downloads: Option<u64>,
-    #[serde(default, rename = "downloadsAllTime")]
-    downloads_all_time: Option<u64>,
     #[serde(default)]
     likes: Option<u64>,
     #[serde(default)]
@@ -597,7 +594,7 @@ impl HubSearchModel {
             repository: self.id,
             commit: immutable_commit(self.sha?)?,
             last_modified: self.last_modified,
-            downloads: self.downloads_all_time.or(self.downloads),
+            downloads: self.downloads,
             likes: self.likes,
             gated: hub_gated(self.gated.as_ref()),
             private: self.private.unwrap_or(false),

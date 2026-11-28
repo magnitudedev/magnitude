@@ -24,9 +24,9 @@ export const formatDownloads = (count: number): string => {
 }
 
 export function DownloadsCount({ count }: { count: number }) {
-  return <span title={`${count.toLocaleString()} all-time downloads on Hugging Face`} className="inline-flex items-center gap-0.5 whitespace-nowrap tabular-nums">
+  return <span title={`${count.toLocaleString()} downloads on Hugging Face in the last 30 days`} className="inline-flex items-center gap-0.5 whitespace-nowrap tabular-nums">
     <DownloadSimpleIcon aria-hidden="true" className="size-3 shrink-0" />
-    {formatDownloads(count)}
+    {formatDownloads(count)} / mo
   </span>
 }
 

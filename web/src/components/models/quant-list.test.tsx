@@ -183,13 +183,13 @@ describe("visibleLadderRungs", () => {
     const html = renderToStaticMarkup(
       <ExpandingModel model={offered} expanded={false} onToggle={() => {}} quantChoice={null} onQuantChoice={() => {}} owned={new Set()} />,
     )
-    expect(html).toContain("16.8M")
+    expect(html).toContain("16.8M / mo")
     expect(html).toContain("unsloth")
     expect(html).toContain("25 quants")
     expect(html).toContain("Best: UD-Q4_K_XL")
     expect(html).not.toContain("4-bit")
     expect(html).not.toContain("context")
-    expect(html.indexOf("16.8M")).toBeLessThan(html.indexOf("unsloth"))
+    expect(html.indexOf("16.8M / mo")).toBeLessThan(html.indexOf("unsloth"))
     expect(html.indexOf("unsloth")).toBeLessThan(html.indexOf("25 quants"))
   })
 
